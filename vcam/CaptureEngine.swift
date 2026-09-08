@@ -30,10 +30,13 @@ final class CaptureEngine {
     /// The zero-based physical input currently being monitored/recorded.
     var onAudioChannel: ((Int) -> Void)?
     var onFailure: ((String) -> Void)?
+    /// Recoverable camera interruption; screen capture and the current take continue.
+    var onCameraFailure: ((String) -> Void)?
 
     private var stream: SCStream?
     private var worker: CaptureWorker?
     private var generation = UUID()
+    private var cameraIntent = UUID()
     private var isStarting = false
 
     func startPreview(configuration: CaptureConfiguration) async throws {
@@ -114,6 +117,12 @@ final class CaptureEngine {
                 self.onFailure?(message)
             }
         }
+        newWorker.onCameraFailure = { [weak self] message, intent in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == token, self.cameraIntent == intent else { return }
+                self.onCameraFailure?(message)
+            }
+        }
         let newStream = SCStream(filter: filter, configuration: settings, delegate: newWorker)
         do {
             try newStream.addStreamOutput(newWorker, type: .screen, sampleHandlerQueue: newWorker.queue)
@@ -129,7 +138,8 @@ final class CaptureEngine {
             await newWorker.beginRendering(clock: newStream.synchronizationClock)
             try await newWorker.startMicrophone()
             guard generation == token else { throw CancellationError() }
-            try await newWorker.startCamera()
+            cameraIntent = UUID()
+            try await newWorker.setCamera(configuration.camera, intent: cameraIntent)
             guard generation == token else { throw CancellationError() }
         } catch {
             await newWorker.shutdown()
@@ -146,9 +156,16 @@ final class CaptureEngine {
 
     func updateCamera(_ configuration: CameraConfiguration) { worker?.updateCamera(configuration) }
 
-    func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double) {
+    func setCamera(_ configuration: CameraConfiguration) async throws {
+        guard let worker, stream != nil else { throw CaptureError.message("Open preview before changing the camera.") }
+        cameraIntent = UUID()
+        try await worker.setCamera(configuration, intent: cameraIntent)
+    }
+
+    func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double,
+                           camera: CameraConfiguration? = nil) {
         worker?.updateComposition(primaryFrame: primaryFrame, secondaryFrame: secondaryFrame,
-                                  layout: layout, splitRatio: splitRatio)
+                                  layout: layout, splitRatio: splitRatio, camera: camera)
     }
 
     func startRecording(to url: URL) async throws {
@@ -160,8 +177,11 @@ final class CaptureEngine {
 
     func stopRecording() async throws -> URL? { try await worker?.stopRecording() }
 
+    func discardRecording() async throws { try await worker?.discardRecording() }
+
     func stopPreview() async {
         generation = UUID()
+        cameraIntent = UUID()
         let oldStream = stream
         let oldWorker = worker
         stream = nil
@@ -185,7 +205,7 @@ private final class CapturePreviewFrame: @unchecked Sendable {
 }
 
 /// Queue confinement includes the timer, writer, crop, frame cache, and stream callbacks.
-final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
+final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "dev.codewithbeto.vcam.capture", qos: .userInitiated)
     var onPreview: (@Sendable (CGImage) -> Void)?
     var onPreviewPixelBuffer: (@Sendable (CVPixelBuffer) -> Void)?
@@ -193,6 +213,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     var onAudioDecibels: (@Sendable (Float) -> Void)?
     var onAudioChannel: (@Sendable (Int) -> Void)?
     var onFailure: (@Sendable (String) -> Void)?
+    var onCameraFailure: (@Sendable (String, UUID) -> Void)?
 
     private let configuration: CaptureConfiguration
     private let context = CIContext(options: [
@@ -208,7 +229,12 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     private var previewPool: CVPixelBufferPool?
     private var previewDeliveryPending = false
     private var microphoneCapture: CaptureMicrophone?
-    private var cameraCapture: CaptureCamera?
+    private var cameraCapture: (any CameraCaptureSession)?
+    private let cameraFactory: @Sendable () -> any CameraCaptureSession
+    private var cameraGeneration = UUID()
+    private var cameraIntent = UUID()
+    private var cameraStarting = false
+    private var cameraStartError: String?
     private var cameraConfiguration: CameraConfiguration
     private var latestCameraBuffer: CVPixelBuffer?
     private var lastCameraAt: CFTimeInterval?
@@ -250,9 +276,11 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     private var finishing = false
     private var recordingFailure: String?
 
-    init(configuration: CaptureConfiguration) {
+    init(configuration: CaptureConfiguration, cameraFactory: @escaping @Sendable () -> any CameraCaptureSession = { CaptureCamera() }) {
         self.configuration = configuration
+        self.cameraFactory = cameraFactory
         cameraConfiguration = configuration.camera
+        cameraConfiguration.placement = .off // Publish enabled placement only after its first frame.
         cameraConfiguration.overlay = configuration.camera.overlay.clamped(in: configuration.outputSize)
         composition = CaptureComposition(layout: configuration.layout,
             splitRatio: CaptureLayout.clampedSplitRatio(configuration.splitRatio),
@@ -317,36 +345,128 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     }
 
     func startCamera() async throws {
-        guard configuration.camera.isEnabled, let deviceID = configuration.camera.deviceID else { return }
-        let camera = CaptureCamera()
-        let shouldStart: Bool = await withCheckedContinuation { continuation in
+        try await setCamera(configuration.camera)
+    }
+
+    func setCamera(_ requested: CameraConfiguration, intent: UUID = UUID()) async throws {
+        guard requested.placement == .off || requested.deviceID?.isEmpty == false else {
+            throw CaptureError.message("Choose a connected camera before enabling it.")
+        }
+        var normalized = requested
+        normalized.overlay = requested.overlay.clamped(in: outputRect.size)
+        let target = normalized
+        let token = UUID()
+        let transition: (old: (any CameraCaptureSession)?, new: (any CameraCaptureSession)?) = try await withCheckedThrowingContinuation { continuation in
             queue.async {
-                guard self.active else { continuation.resume(returning: false); return }
-                self.cameraCapture = camera
-                self.lastCameraAt = CACurrentMediaTime()
-                continuation.resume(returning: true)
+                guard self.active else { continuation.resume(throwing: CancellationError()); return }
+                self.cameraIntent = intent
+                if target.isEnabled, self.cameraCapture != nil, !self.cameraStarting,
+                   self.cameraConfiguration.isEnabled, self.cameraConfiguration.deviceID == target.deviceID {
+                    self.cameraConfiguration = target
+                    continuation.resume(returning: (nil, nil))
+                    return
+                }
+                let old = self.cameraCapture
+                self.cameraGeneration = token
+                self.cameraCapture = nil
+                self.cameraStarting = target.isEnabled
+                self.cameraStartError = nil
+                self.latestCameraBuffer = nil
+                self.lastCameraAt = nil
+                self.cameraConfiguration = target
+                self.cameraConfiguration.placement = .off
+                let new = target.isEnabled ? self.cameraFactory() : nil
+                self.cameraCapture = new
+                continuation.resume(returning: (old, new))
             }
         }
-        guard shouldStart else { throw CancellationError() }
-        try await camera.start(deviceID: deviceID, framesPerSecond: configuration.framesPerSecond,
-            delegate: self, sampleQueue: queue) { [weak self] message in
-            self?.queue.async { [weak self] in self?.fail(message) }
+        await transition.old?.stop()
+        guard let camera = transition.new, let deviceID = target.deviceID else { return }
+        do {
+            try Task.checkCancellation()
+            try await checkCameraTransition(token)
+            try await camera.start(deviceID: deviceID, framesPerSecond: configuration.framesPerSecond,
+                sampleQueue: queue, onFrame: { [weak self] buffer in
+                    // CameraCaptureSession delivers directly on this queue. Keeping
+                    // a single slot bounds latency and memory even during startup.
+                    guard let self, self.active, self.cameraGeneration == token, self.cameraCapture != nil else { return }
+                    self.latestCameraBuffer = buffer
+                    self.lastCameraAt = CACurrentMediaTime()
+                }, onFailure: { [weak self] message in
+                    self?.queue.async { [weak self] in self?.cameraFailed(message, token: token) }
+                })
+            let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+            while true {
+                try Task.checkCancellation()
+                let ready = try await checkCameraTransition(token, publish: target)
+                if ready { return }
+                guard ContinuousClock.now < deadline else {
+                    throw CaptureError.message("The camera did not deliver a frame. Check Camera access and its connection; screen recording can continue.")
+                }
+                try await Task.sleep(for: .milliseconds(50))
+            }
+        } catch {
+            await withCheckedContinuation { continuation in
+                queue.async {
+                    if self.cameraGeneration == token {
+                        self.cameraGeneration = UUID()
+                        self.cameraCapture = nil
+                        self.latestCameraBuffer = nil
+                        self.cameraStarting = false
+                        self.cameraStartError = nil
+                        self.cameraConfiguration.placement = .off
+                    }
+                    continuation.resume()
+                }
+            }
+            await camera.stop()
+            throw error
         }
-        let stillActive: Bool = await withCheckedContinuation { continuation in
-            queue.async { continuation.resume(returning: self.active && self.cameraCapture === camera) }
+    }
+
+    @discardableResult
+    private func checkCameraTransition(_ token: UUID, publish target: CameraConfiguration? = nil) async throws -> Bool {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                guard self.active, self.cameraGeneration == token else {
+                    continuation.resume(throwing: CancellationError()); return
+                }
+                if let message = self.cameraStartError {
+                    continuation.resume(throwing: CaptureError.message(message)); return
+                }
+                let ready = self.latestCameraBuffer != nil
+                if ready, let target {
+                    self.cameraConfiguration = target
+                    self.cameraStarting = false
+                }
+                continuation.resume(returning: ready)
+            }
         }
-        if !stillActive { await camera.stop(); throw CancellationError() }
+    }
+
+    private func cameraFailed(_ message: String, token: UUID) {
+        guard active, cameraGeneration == token else { return }
+        if cameraStarting { cameraStartError = message; return }
+        guard let camera = cameraCapture else { return }
+        cameraGeneration = UUID()
+        cameraCapture = nil
+        latestCameraBuffer = nil
+        cameraConfiguration.placement = .off
+        onCameraFailure?(message, cameraIntent)
+        Task { await camera.stop() }
     }
 
     func updateCamera(_ configuration: CameraConfiguration) {
-        queue.async {
-            // Changing devices needs the parent's preview restart. An already
-            // active camera can move between overlay and replacement cells.
-            guard configuration.deviceID == self.cameraConfiguration.deviceID,
-                  !configuration.isEnabled || self.configuration.camera.isEnabled else { return }
-            self.cameraConfiguration = configuration
-            self.cameraConfiguration.overlay = configuration.overlay.clamped(in: self.outputRect.size)
-        }
+        queue.async { self.applyCameraEdits(configuration) }
+    }
+
+    private func applyCameraEdits(_ configuration: CameraConfiguration) {
+        // Cheap edits to an active camera. Starting/stopping hardware goes
+        // through setCamera so Off actually releases the physical device.
+        guard configuration.deviceID == cameraConfiguration.deviceID,
+              configuration.isEnabled, cameraConfiguration.isEnabled, !cameraStarting else { return }
+        cameraConfiguration = configuration
+        cameraConfiguration.overlay = configuration.overlay.clamped(in: outputRect.size)
     }
 
     func previewWasDelivered() {
@@ -360,7 +480,8 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         }
     }
 
-    func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double) {
+    func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double,
+                           camera: CameraConfiguration? = nil) {
         queue.async {
             func valid(_ frame: CGRect) -> Bool {
                 frame.width.isFinite && frame.height.isFinite && frame.minX.isFinite && frame.minY.isFinite &&
@@ -372,6 +493,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
             self.composition = CaptureComposition(layout: layout,
                 splitRatio: CaptureLayout.clampedSplitRatio(splitRatio),
                 primaryFrame: primaryFrame, secondaryFrame: secondaryFrame)
+            if let camera { self.applyCameraEdits(camera) }
         }
     }
 
@@ -483,9 +605,45 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         }
     }
 
+    func discardRecording() async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                guard !self.finishing else {
+                    continuation.resume(throwing: CaptureError.message("This take is already being saved. Wait for it to finish before starting another take.")); return
+                }
+                guard let writer = self.writer else { continuation.resume(); return }
+                guard writer.status != .completed else {
+                    continuation.resume(throwing: CaptureError.message("A completed recording cannot be discarded as an unfinished take.")); return
+                }
+                let unfinishedURL = self.recordingURL
+                self.writer = nil
+                self.videoInput = nil
+                self.audioInput = nil
+                self.adaptor = nil
+                self.recordingURL = nil
+                self.firstVideoTime = nil
+                self.lastVideoTime = nil
+                self.recordingStopTime = nil
+                self.lastAudioTime = nil
+                self.pendingAudio.removeAll()
+                self.appendedVideoFrames = 0
+                self.recordingFailure = nil
+                writer.cancelWriting()
+                do {
+                    // Only this worker's current unfinished URL is eligible. Saved
+                    // takes have already been detached by finishRecording.
+                    if let url = unfinishedURL, FileManager.default.fileExists(atPath: url.path) {
+                        try FileManager.default.removeItem(at: url)
+                    }
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
     func shutdown() async {
         _ = try? await stopRecording()
-        let devices: (CaptureMicrophone?, CaptureCamera?) = await withCheckedContinuation { continuation in
+        let devices: (CaptureMicrophone?, (any CameraCaptureSession)?) = await withCheckedContinuation { continuation in
             queue.async {
                 let devices = (self.microphoneCapture, self.cameraCapture)
                 self.active = false
@@ -493,6 +651,8 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                 self.timer = nil
                 self.microphoneCapture = nil
                 self.cameraCapture = nil
+                self.cameraGeneration = UUID()
+                self.cameraStarting = false
                 continuation.resume(returning: devices)
             }
         }
@@ -543,16 +703,6 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if let camera = cameraCapture, output === camera.output {
-            guard active, CMSampleBufferIsValid(sampleBuffer), CMSampleBufferDataIsReady(sampleBuffer),
-                  let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-            // Only retain the newest frame; camera audio never enters this path.
-            // The output timer uses its existing screen/audio clock, sampling the
-            // latest camera image without assuming the camera PTS shares an epoch.
-            latestCameraBuffer = buffer
-            lastCameraAt = CACurrentMediaTime()
-            return
-        }
         guard active, let microphone = microphoneCapture, output === microphone.output,
               CMSampleBufferIsValid(sampleBuffer), CMSampleBufferDataIsReady(sampleBuffer),
               let sourceClock = microphone.synchronizationClock else { return }
@@ -717,7 +867,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                 fail("The selected microphone stopped delivering audio. Check its connection and microphone access.")
             }
             if cameraConfiguration.isEnabled, now - (lastCameraAt ?? startedAt) > 6 {
-                fail("The selected camera stopped delivering video. Check its connection and Camera access, then reopen preview.")
+                cameraFailed("The selected camera stopped delivering video. Screen recording can continue; reconnect or reselect the camera.", token: cameraGeneration)
             }
         }
         drainAudio()
@@ -901,9 +1051,183 @@ private final class SyntheticFrame: @unchecked Sendable {
     let buffer: CVPixelBuffer // Filled before crossing into the serial worker queue.
     init(_ buffer: CVPixelBuffer) { self.buffer = buffer }
 }
+/// A device-free provider exercises the real camera activation/teardown path.
+/// It deliberately emits a late frame/error after stop to check session gating.
+private final class SyntheticCameraSession: CameraCaptureSession, @unchecked Sendable {
+    let frame: SyntheticFrame?
+    let failsOnStart: Bool
+    private let lock = NSLock()
+    private var stopped = false
+    private var timer: DispatchSourceTimer?
+    private var lateDelivery: (@Sendable () -> Void)?
+    init(frame: SyntheticFrame?, failsOnStart: Bool = false) { self.frame = frame; self.failsOnStart = failsOnStart }
+    func start(deviceID: String, framesPerSecond: Int, sampleQueue: DispatchQueue,
+               onFrame: @escaping @Sendable (CVPixelBuffer) -> Void,
+               onFailure: @escaping @Sendable (String) -> Void) async throws {
+        try await Task.sleep(for: .milliseconds(40))
+        if failsOnStart || deviceID == "synthetic-failing" { throw CaptureError.message("Synthetic camera could not start.") }
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            sampleQueue.async {
+                self.lock.lock()
+                defer { self.lock.unlock() }
+                guard !self.stopped else { continuation.resume(throwing: CancellationError()); return }
+                let timer = DispatchSource.makeTimerSource(queue: sampleQueue)
+                timer.schedule(deadline: .now() + 0.04, repeating: .milliseconds(33))
+                timer.setEventHandler { if let frame = self.frame, deviceID != "synthetic-no-frames" { onFrame(frame.buffer) } }
+                self.timer = timer
+                self.lateDelivery = {
+                    sampleQueue.asyncAfter(deadline: .now() + 0.03) {
+                        if let frame = self.frame { onFrame(frame.buffer) }
+                        onFailure("Late callback from a stopped synthetic camera.")
+                    }
+                }
+                timer.resume()
+                continuation.resume()
+            }
+        }
+    }
+    func stop() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            stopped = true
+            timer?.cancel(); timer = nil
+            let late = lateDelivery; lateDelivery = nil
+            lock.unlock()
+            late?()
+            continuation.resume()
+        }
+    }
+    var isStopped: Bool { lock.lock(); defer { lock.unlock() }; return stopped }
+}
+private final class SyntheticCameraHolder: @unchecked Sendable {
+    var latest: SyntheticCameraSession? // Factory and reads run on the worker queue.
+}
+private final class SyntheticLifecycleState: @unchecked Sendable {
+    var audioSamples = 0
+    var recoverableErrors = 0
+    var fatalError: String?
+}
 // Compiled only by scripts/validate-capture.swift. Synthetic inputs exercise the
 // exact production crop, timer tick, encoder, microphone metering and finish path.
 extension CaptureWorker {
+    static func validateRecordingLifecycle(in directory: URL) async throws -> URL {
+        let bounds = CGRect(x: 0, y: 0, width: 640, height: 960)
+        var config = CaptureConfiguration(displayID: CGMainDisplayID(), displayFrame: bounds, captureFrame: bounds,
+            framesPerSecond: 30, microphoneID: "synthetic-microphone", showsCursor: false)
+        config.outputSize = bounds.size
+        var created: CVPixelBuffer?
+        guard CVPixelBufferCreate(nil, 640, 960, kCVPixelFormatType_32BGRA,
+            [kCVPixelBufferIOSurfacePropertiesKey as String: [:]] as CFDictionary, &created) == kCVReturnSuccess,
+              let buffer = created else { throw CaptureError.message("Cannot allocate lifecycle fixture.") }
+        CIContext().render(CIImage(color: CIColor(red: 0.2, green: 0.5, blue: 0.3)).cropped(to: bounds),
+                           to: buffer, bounds: bounds, colorSpace: CaptureColor.space)
+        let frame = SyntheticFrame(buffer)
+        let state = SyntheticLifecycleState()
+        let worker = CaptureWorker(configuration: config, cameraFactory: { SyntheticCameraSession(frame: frame) })
+        let audioTimer = DispatchSource.makeTimerSource(queue: worker.queue)
+        let audioOrigin = CMClockGetTime(CMClockGetHostTimeClock())
+        await withCheckedContinuation { continuation in
+            worker.queue.async {
+                worker.active = true
+                worker.startedAt = CACurrentMediaTime()
+                worker.captureClock = CMClockGetHostTimeClock()
+                worker.latestBuffer = frame.buffer
+                worker.onFailure = { state.fatalError = $0 }
+                worker.onCameraFailure = { _, _ in state.recoverableErrors += 1 }
+                audioTimer.schedule(deadline: .now(), repeating: .milliseconds(10))
+                audioTimer.setEventHandler {
+                    let elapsed = CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), audioOrigin).seconds
+                    let count = max(1, Int(elapsed * 48_000) - state.audioSamples)
+                    let time = CMTimeAdd(audioOrigin, CMTime(value: Int64(state.audioSamples), timescale: 48_000))
+                    if let sample = try? syntheticMicrophoneSample(count: count, offset: state.audioSamples, at: time, competingInput: false) {
+                        worker.processMicrophone(sample, at: time)
+                        state.audioSamples += count
+                    }
+                }
+                audioTimer.resume()
+                continuation.resume()
+            }
+        }
+        let discarded = directory.appendingPathComponent("discarded.mp4")
+        let saved = directory.appendingPathComponent("saved-restart.mp4")
+        let laterDiscard = directory.appendingPathComponent("later-discard.mp4")
+        let protected = directory.appendingPathComponent("unrelated.txt")
+        let sentinel = Data("Keep this unrelated file.".utf8)
+        try sentinel.write(to: protected)
+        do {
+            await worker.beginRendering(clock: CMClockGetHostTimeClock())
+            try await worker.startRecording(to: discarded)
+            let originalWriter: ObjectIdentifier = await withCheckedContinuation { continuation in
+                worker.queue.async { continuation.resume(returning: ObjectIdentifier(worker.writer!)) }
+            }
+            var on = CameraConfiguration(deviceID: "synthetic-camera", placement: .overlay)
+            for device: String? in ["synthetic-failing", "synthetic-no-frames", nil, ""] {
+                var failing = on; failing.deviceID = device
+                var rejected = false
+                do { try await worker.setCamera(failing) } catch { rejected = true }
+                guard rejected else { throw CaptureError.message("A failing camera unexpectedly activated.") }
+                try await worker.requireSyntheticState({ $0.writer.map(ObjectIdentifier.init) == originalWriter && !$0.cameraConfiguration.isEnabled && state.fatalError == nil },
+                    "Camera activation failure damaged the ongoing screen take.")
+            }
+            let pending = Task { try await worker.setCamera(on) }
+            try await Task.sleep(for: .milliseconds(15))
+            var off = on; off.placement = .off
+            try await worker.setCamera(off)
+            switch await pending.result {
+            case .success: throw CaptureError.message("Turning Off during camera startup did not cancel activation.")
+            case .failure: break
+            }
+            try await worker.setCamera(on)
+            try await worker.setCamera(off)
+            try await worker.setCamera(on)
+            try await Task.sleep(for: .milliseconds(100))
+            try await worker.requireSyntheticState({ $0.writer.map(ObjectIdentifier.init) == originalWriter && $0.cameraConfiguration.isEnabled && state.recoverableErrors == 0 && state.fatalError == nil },
+                "A stopped camera's late callback affected its replacement or the writer.")
+            await withCheckedContinuation { continuation in
+                worker.queue.async {
+                    worker.cameraFailed("Synthetic active camera disconnected.", token: worker.cameraGeneration)
+                    continuation.resume()
+                }
+            }
+            try await Task.sleep(for: .milliseconds(60))
+            try await worker.requireSyntheticState({ $0.writer.map(ObjectIdentifier.init) == originalWriter && !$0.cameraConfiguration.isEnabled && state.recoverableErrors == 1 && state.fatalError == nil },
+                "An active camera interruption must recover to screen-only without cancelling the take.")
+            on.placement = .regionA
+            try await worker.setCamera(on)
+            try await worker.discardRecording()
+            guard !FileManager.default.fileExists(atPath: discarded.path) else { throw CaptureError.message("Discard left its unfinished file on disk.") }
+            try await worker.requireSyntheticState({ $0.active && $0.timer != nil && $0.latestBuffer != nil && $0.microphoneFormat != nil && $0.cameraConfiguration.isEnabled && $0.writer == nil },
+                "Discard stopped preview or its selected inputs.")
+            try await worker.startRecording(to: saved)
+            try await Task.sleep(for: .milliseconds(750))
+            guard try await worker.stopRecording() == saved else { throw CaptureError.message("Restarted take did not save.") }
+            let savedBytes = try Data(contentsOf: saved)
+            try await worker.discardRecording() // No current writer: must not touch the saved take.
+            try await worker.startRecording(to: laterDiscard)
+            try await Task.sleep(for: .milliseconds(200))
+            try await worker.discardRecording()
+            guard !FileManager.default.fileExists(atPath: laterDiscard.path), try Data(contentsOf: saved) == savedBytes,
+                  try Data(contentsOf: protected) == sentinel else { throw CaptureError.message("Discard altered a completed or unrelated file.") }
+            try await worker.requireSyntheticState({ state.fatalError == nil && $0.active }, "Lifecycle exercise stopped screen capture.")
+            audioTimer.cancel()
+            await worker.shutdown()
+            return saved
+        } catch {
+            audioTimer.cancel()
+            await worker.shutdown()
+            throw error
+        }
+    }
+
+    private func requireSyntheticState(_ predicate: @escaping @Sendable (CaptureWorker) -> Bool, _ message: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                if predicate(self) { continuation.resume() }
+                else { continuation.resume(throwing: CaptureError.message(message)) }
+            }
+        }
+    }
+
     /// Injects known, color-tagged pixels through the production preview and encoder.
     static func recordColorFixture(_ buffer: CVPixelBuffer, to url: URL, outputSize: CGSize,
                                    onPreview: @escaping @Sendable (CVPixelBuffer) -> Void) async throws -> URL {
@@ -956,9 +1280,14 @@ extension CaptureWorker {
         config.layout = initial.layout
         config.splitRatio = initial.splitRatio
         config.camera = cameras.first ?? CameraConfiguration()
-        let worker = CaptureWorker(configuration: config)
         let frame = SyntheticFrame(buffer)
         let camera = cameraBuffer.map(SyntheticFrame.init)
+        let cameraHolder = SyntheticCameraHolder()
+        let worker = CaptureWorker(configuration: config, cameraFactory: {
+            let provider = SyntheticCameraSession(frame: camera)
+            cameraHolder.latest = provider
+            return provider
+        })
         let audio = SyntheticAudioState()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             worker.queue.async {
@@ -966,8 +1295,6 @@ extension CaptureWorker {
                 worker.startedAt = CACurrentMediaTime()
                 worker.captureClock = CMClockGetHostTimeClock()
                 worker.latestBuffer = frame.buffer
-                worker.latestCameraBuffer = camera?.buffer
-                worker.lastCameraAt = CACurrentMediaTime()
                 do {
                     let time = CMClockGetTime(CMClockGetHostTimeClock())
                     worker.processMicrophone(try syntheticMicrophoneSample(count: 512, offset: 0,
@@ -977,13 +1304,27 @@ extension CaptureWorker {
             }
         }
         do {
+            try await worker.startCamera()
             await worker.beginRendering(clock: CMClockGetHostTimeClock())
             try await worker.startRecording(to: url)
             var times: [Double] = []
             for (index, phase) in phases.enumerated() {
                 worker.updateComposition(primaryFrame: phase.primaryFrame, secondaryFrame: phase.secondaryFrame,
                     layout: phase.layout, splitRatio: phase.splitRatio)
-                if cameras.indices.contains(index) { worker.updateCamera(cameras[index]) }
+                if cameras.indices.contains(index) {
+                    try await worker.setCamera(cameras[index])
+                    if !cameras[index].isEnabled {
+                        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                            worker.queue.async {
+                                guard worker.cameraCapture == nil, worker.latestCameraBuffer == nil,
+                                      cameraHolder.latest?.isStopped ?? true else {
+                                    continuation.resume(throwing: CaptureError.message("Camera Off did not release its provider and latest frame.")); return
+                                }
+                                continuation.resume()
+                            }
+                        }
+                    }
+                }
                 let phaseStart: Double = await withCheckedContinuation { continuation in
                     worker.queue.async {
                         continuation.resume(returning: CMTimeSubtract(worker.captureTime()!, worker.firstVideoTime!).seconds)
@@ -992,7 +1333,6 @@ extension CaptureWorker {
                 for _ in 0..<12 {
                     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                         worker.queue.async {
-                            if camera != nil { worker.lastCameraAt = CACurrentMediaTime() }
                             let first = worker.firstVideoTime!
                             let elapsed = CMTimeSubtract(worker.captureTime()!, first).seconds
                             let count = max(1, Int(elapsed * 48_000) - audio.sampleCount)

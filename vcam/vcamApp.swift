@@ -11,14 +11,20 @@ struct vcamApp: App {
             ContentView(model: model)
                 .onAppear { delegate.model = model }
         }
-        .windowResizability(.contentSize)
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 1120, height: 900)
         .defaultPosition(.center)
         .commands {
             CommandMenu("Capture") {
-                Button(model.isRecording ? "Stop and Save Recording" : "Start Recording") {
-                    Task { await model.toggleRecording() }
-                }
-                .disabled(model.isBusy)
+                Button("Start Recording") { Task { await model.toggleRecording() } }
+                    .disabled(model.isRecording || model.isBusy)
+                Button("Finish Take") { Task { await model.finishRecording() } }
+                    .disabled(!model.isRecording || model.isBusy)
+                Button("Restart Take") { Task { await model.restartRecording() } }
+                    .disabled(!model.isRecording || model.isBusy)
+                Button("Cancel Take", role: .destructive) { Task { await model.cancelRecording() } }
+                    .disabled(!model.isRecording || model.isBusy)
+                Divider()
                 Button(model.isFrameVisible ? "Hide Frame" : "Show Frame") { model.toggleFrame() }
                     .disabled(model.isRecording || model.isBusy)
                 Divider()

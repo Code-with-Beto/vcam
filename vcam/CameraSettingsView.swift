@@ -1,59 +1,72 @@
 import SwiftUI
 import AVFoundation
 
-/// Camera is optional; choosing a placement is the point where access matters.
+enum CameraSettingsSection { case live, setup }
+
+/// The source is configured before recording; composition stays adjustable live.
 struct CameraSettingsView: View {
     @Bindable var model: RecorderModel
+    var section: CameraSettingsSection = .live
 
     private var canChangeSource: Bool { !model.isRecording && !model.isBusy && !model.requestingCamera }
+    private var canChangePlacement: Bool { !model.isBusy && !model.requestingCamera }
     private var canAdjust: Bool { !model.isBusy }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Camera").frame(width: 90, alignment: .leading)
-                Picker("Camera placement", selection: Binding(
-                    get: { model.cameraPlacement },
-                    set: { value in Task { await model.setCameraPlacement(value) } }
-                )) {
-                    Text("Off").tag(CameraPlacement.off)
-                    Text("Floating overlay").tag(CameraPlacement.overlay)
-                    if model.hasTwoRegions {
-                        Text("Replace \(model.regionTitle(.primary))").tag(CameraPlacement.regionA)
-                        Text("Replace \(model.regionTitle(.secondary))").tag(CameraPlacement.regionB)
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 7) {
+                Text(section == .live ? "Camera" : "Camera device").font(.headline)
+                SettingHelp("Camera", "Choose the camera device in Setup. Use Live to add a floating camera, fill either split region, or turn it off during a take. Camera and microphone selections are independent.")
+                Spacer()
+            }
+            if section == .live {
+                placementControls
+                if model.cameraPlacement != .off {
+                    if model.cameraAuthorization != .authorized { permissionControls }
+                    if model.cameraPlacement == .overlay { overlayControls }
+                    HStack {
+                        Toggle("Mirror camera", isOn: Binding(
+                            get: { model.mirrorsCamera }, set: { model.setMirrorsCamera($0) }
+                        ))
+                        .toggleStyle(.checkbox).disabled(!canAdjust)
+                        SettingHelp("Mirror camera", "Flip the camera horizontally in both the preview and saved video. Turn this off when showing text or objects that need to read correctly. You can change this during a take.")
+                        Spacer()
                     }
                 }
-                .labelsHidden().disabled(!canChangeSource)
-                SettingHelp("Camera placement", "Add your camera as a floating overlay, or let it fill either region of a split composition. The camera is saved in the video. Off keeps camera access optional. Stop recording before changing the camera or its placement.")
-            }
-
-            if model.cameraPlacement != .off {
-                if model.cameraAuthorization != .authorized {
-                    permissionControls
-                } else {
+            } else {
+                if model.cameraAuthorization == .authorized {
                     deviceControls
-                }
-
-                if model.cameraPlacement == .overlay {
-                    overlayControls
-                }
-
-                HStack {
-                    Toggle("Mirror camera", isOn: Binding(
-                        get: { model.mirrorsCamera }, set: { model.setMirrorsCamera($0) }
-                    ))
-                    .toggleStyle(.checkbox).disabled(!canAdjust)
-                    SettingHelp("Mirror camera", "Flip the camera horizontally in both the preview and saved video. Turn this off when showing text or objects that need to read correctly. You can change this during a take.")
-                    Spacer()
+                    Text(model.isRecording ? "Finish this take before switching camera devices." : "Choose the device here, then add it to your composition in Live.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    permissionControls
                 }
             }
+        }
+    }
+
+    private var placementControls: some View {
+        HStack(spacing: 8) {
+            Picker("Camera placement", selection: Binding(
+                get: { model.cameraPlacement },
+                set: { value in Task { await model.setCameraPlacement(value) } }
+            )) {
+                Text("Off").tag(CameraPlacement.off)
+                Text("Floating overlay").tag(CameraPlacement.overlay)
+                if model.hasTwoRegions {
+                    Text("Replace \(model.regionTitle(.primary))").tag(CameraPlacement.regionA)
+                    Text("Replace \(model.regionTitle(.secondary))").tag(CameraPlacement.regionB)
+                }
+            }
+            .labelsHidden().disabled(!canChangePlacement)
+            SettingHelp("Camera placement", "Add a floating camera or fill either region of a split composition. Placement changes appear in the current take. Off leaves screen recording running without the camera. To use another device, finish the take and choose it in Setup.")
         }
     }
 
     private var deviceControls: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Device").frame(width: 90, alignment: .leading)
                 Picker("Camera device", selection: Binding(
                     get: { model.selectedCameraID },
                     set: { value in Task { await model.setCameraDevice(value) } }
@@ -91,10 +104,12 @@ struct CameraSettingsView: View {
                 } else {
                     Button("Open Camera Settings") { model.openCameraPermissions() }
                 }
-                Button("Continue without camera") {
-                    Task { await model.setCameraPlacement(.off) }
-                }.buttonStyle(.link)
-            }.disabled(!canChangeSource)
+                if model.cameraPlacement != .off {
+                    Button("Continue without camera") {
+                        Task { await model.setCameraPlacement(.off) }
+                    }.buttonStyle(.link)
+                }
+            }.disabled(!canChangePlacement)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -111,18 +126,21 @@ struct CameraSettingsView: View {
 
     private var overlayControls: some View {
         VStack(alignment: .leading, spacing: 9) {
-            HStack {
-                Text("Shape").frame(width: 90, alignment: .leading)
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    Text("Shape").font(.callout)
+                    SettingHelp("Camera shape", "The circle uses a square crop. The rounded rectangle uses a 4:3 crop. Both fill their frame, so the edges of the camera image may be cropped.")
+                    Spacer()
+                }
                 Picker("Camera overlay shape", selection: Binding(
                     get: { model.cameraOverlay.shape },
                     set: { shape in updateOverlay { $0.shape = shape } }
                 )) {
                     ForEach(CameraShape.allCases) { Text($0.title).tag($0) }
                 }.labelsHidden().pickerStyle(.segmented)
-                SettingHelp("Camera shape", "The circle uses a square crop. The rounded rectangle uses a 4:3 crop. Both fill their frame, so the edges of the camera image may be cropped.")
             }
             HStack(spacing: 8) {
-                Text("Size").frame(width: 90, alignment: .leading)
+                Text("Size").frame(width: 54, alignment: .leading)
                 Slider(value: Binding(
                     get: { model.cameraOverlay.widthFraction },
                     set: { width in updateOverlay { $0.widthFraction = width } }
@@ -134,7 +152,7 @@ struct CameraSettingsView: View {
                 SettingHelp("Camera size", "Camera width is 15–65% of the video's shorter dimension. This keeps its size consistent when switching orientation. Drag the camera in the preview to move it, or drag its corner handle to resize it, even while recording.")
             }
             HStack(spacing: 7) {
-                Text("Position").frame(width: 90, alignment: .leading)
+                Text("Position").frame(width: 54, alignment: .leading)
                 cornerButton("Top left", symbol: "arrow.up.left", right: false, bottom: false)
                 cornerButton("Top right", symbol: "arrow.up.right", right: true, bottom: false)
                 cornerButton("Bottom left", symbol: "arrow.down.left", right: false, bottom: true)

@@ -91,6 +91,7 @@ final class RecorderModel {
     private(set) var isRecording = false
     private(set) var isBusy = false {
         didSet {
+            refreshOverlay()
             if !isBusy {
                 let waiters = transitionWaiters
                 transitionWaiters.removeAll()
@@ -167,6 +168,13 @@ final class RecorderModel {
             guard let self else { return }
             Task { await self.handleCaptureFailure(message) }
         }
+        engine.onCameraFailure = { [weak self] message in
+            guard let self else { return }
+            self.cameraPlacement = .off
+            self.saveCameraSettings()
+            if self.isFrameVisible { self.showFrame() }
+            self.notice = message + (self.isRecording ? " Screen and microphone recording continue." : " Choose a camera to try again.")
+        }
         overlay.onFrameChanged = { [weak self] rect in
             guard let self else { return }
             self.captureFrame = rect
@@ -189,6 +197,10 @@ final class RecorderModel {
             Task { await self?.toggleRecording() }
         }
         secondaryOverlay.onHide = { [weak self] in self?.toggleFrame() }
+        for handle in [overlay, secondaryOverlay] {
+            handle.onCancelRecording = { [weak self] in Task { await self?.cancelRecording() } }
+            handle.onRestartRecording = { [weak self] in Task { await self?.restartRecording() } }
+        }
     }
 
     var outputSize: CGSize { resolution.size(for: orientation) }
@@ -299,7 +311,7 @@ final class RecorderModel {
     }
 
     func requestCameraAccess() async {
-        guard !requestingCamera, !isBusy, !isRecording else { return }
+        guard !requestingCamera, !isBusy, !isShuttingDown else { return }
         requestingCamera = true
         defer { requestingCamera = false }
         if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
@@ -334,33 +346,39 @@ final class RecorderModel {
     }
 
     func setCameraDevice(_ id: String) async {
-        guard id != selectedCameraID else { return }
+        guard !isRecording, id != selectedCameraID else { return }
         await reconfigureCamera(placement: cameraPlacement, deviceID: id)
     }
 
     private func reconfigureCamera(placement: CameraPlacement, deviceID: String) async {
-        guard !isRecording && !isBusy && !isShuttingDown else { return }
+        guard !isBusy && !isShuttingDown else { return }
         commitFrameEdits?()
+        refreshPermissions()
+        // A permission request must never tear down an ongoing screen take.
+        // Idle selections still configure the next preview and its onboarding.
+        if isPreviewing && placement != .off && cameraAuthorization != .authorized {
+            notice = "Enable Camera access in Setup, then choose its placement. Your recording can keep running."
+            return
+        }
         isBusy = true
         defer { isBusy = false }
-        let wasPreviewing = isPreviewing
-        if wasPreviewing {
-            await engine.stopPreview()
-            isPreviewing = false
-            previewSurface.clear()
-            audioLevel = 0
-            audioDecibels = -120
+        if isPreviewing {
+            let requested = CameraConfiguration(deviceID: deviceID.isEmpty ? nil : deviceID,
+                placement: placement, overlay: cameraOverlay, mirrored: mirrorsCamera)
+            do {
+                try await engine.setCamera(requested)
+            } catch {
+                cameraPlacement = .off
+                saveCameraSettings()
+                if isFrameVisible { showFrame() }
+                notice = error.localizedDescription + (isRecording ? " Your screen recording is still running." : "")
+                return
+            }
         }
-        guard !isShuttingDown else { return }
         cameraPlacement = placement
         selectedCameraID = deviceID
         saveCameraSettings()
-        refreshPermissions()
         if isFrameVisible { showFrame() }
-        if wasPreviewing, permissionsReady {
-            do { try await beginPreview() }
-            catch { errorMessage = error.localizedDescription }
-        }
     }
 
     func setCameraOverlay(_ value: CameraOverlayConfiguration) {
@@ -389,7 +407,7 @@ final class RecorderModel {
     }
 
     func setFrameWidth(_ width: Double) {
-        guard width.isFinite, width > 0, !isRecording && !isBusy, !activeRegionIsCamera else { return }
+        guard width.isFinite, width > 0, !isBusy && !isShuttingDown, !activeRegionIsCamera else { return }
         frameWidth = width
         resizeFrame()
     }
@@ -411,7 +429,7 @@ final class RecorderModel {
     }
 
     func setLayout(_ value: CaptureLayout) {
-        guard !isRecording && !isBusy && !isShuttingDown, value != layout else { return }
+        guard !isBusy && !isShuttingDown, value != layout else { return }
         commitFrameEdits?()
         let previousCells = [destinationRect(for: .primary), secondaryOutputCell ?? destinationRect(for: .secondary)]
         layout = value
@@ -423,7 +441,6 @@ final class RecorderModel {
         remapFrames(from: previousCells)
         saveFramePosition()
         updateComposition()
-        engine.updateCamera(cameraConfiguration)
         if isFrameVisible { showFrame() }
     }
 
@@ -500,7 +517,7 @@ final class RecorderModel {
     private func updateComposition() {
         engine.updateComposition(primaryFrame: captureFrame,
             secondaryFrame: hasTwoRegions ? secondaryCaptureFrame : nil,
-            layout: layout, splitRatio: splitRatio)
+            layout: layout, splitRatio: splitRatio, camera: cameraConfiguration)
     }
 
     func setOrientation(_ value: CaptureOrientation) async {
@@ -577,7 +594,7 @@ final class RecorderModel {
     }
 
     func resizeFrame() {
-        guard !isRecording && !isBusy, let display = selectedDisplay else { return }
+        guard !isBusy && !isShuttingDown, !activeRegionIsCamera, let display = selectedDisplay else { return }
         frameWidth = min(max(frameWidth, minimumFrameWidth), maximumFrameWidth)
         let current = activeCaptureFrame
         let resized = CaptureGeometry.frame(width: frameWidth,
@@ -611,12 +628,12 @@ final class RecorderModel {
             overlay.show(frame: captureFrame, displayFrame: display.visibleFrame, guides: showsGuides,
             guideBottomInset: layout == .stacked ? 0.08 : guideBottomInset,
             label: hasTwoRegions ? regionTitle(.primary) : nil, accent: .systemCyan,
-                isSelected: selectedRegion == .primary)
+                isSelected: selectedRegion == .primary, busy: isBusy)
         } else { overlay.hide() }
         if hasTwoRegions && !isCameraRegion(.secondary) {
             secondaryOverlay.show(frame: secondaryCaptureFrame, displayFrame: display.visibleFrame, guides: showsGuides,
                 guideBottomInset: guideBottomInset, label: regionTitle(.secondary), accent: .systemOrange,
-                isSelected: selectedRegion == .secondary)
+                isSelected: selectedRegion == .secondary, busy: isBusy)
         } else { secondaryOverlay.hide() }
         isFrameVisible = true
         refreshOverlay()
@@ -658,23 +675,73 @@ final class RecorderModel {
             guard !isShuttingDown else { return }
             let scoped = folder.startAccessingSecurityScopedResource()
             if scoped { securityScopedFolder = folder }
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
-            let name = "vcam \(formatter.string(from: Date())) \(UUID().uuidString.prefix(4)).mp4"
-            try await engine.startRecording(to: folder.appendingPathComponent(name))
-            isRecording = true
-            elapsedSeconds = 0
-            recordingStart = Date()
-            timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak model = self] _ in
-                Task { @MainActor [weak model] in
-                    guard let model, let start = model.recordingStart else { return }
-                    model.elapsedSeconds = Int(Date().timeIntervalSince(start))
-                }
-            }
-            refreshOverlay()
+            try await startTake(in: folder)
         } catch {
             releaseOutputFolder()
             if !isShuttingDown { errorMessage = error.localizedDescription }
+        }
+    }
+
+    private func startTake(in folder: URL) async throws {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        let name = "vcam \(formatter.string(from: Date())) \(UUID().uuidString.prefix(8)).mp4"
+        try await engine.startRecording(to: folder.appendingPathComponent(name))
+        isRecording = true
+        elapsedSeconds = 0
+        recordingStart = Date()
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak model = self] _ in
+            Task { @MainActor [weak model] in
+                guard let model, let start = model.recordingStart else { return }
+                model.elapsedSeconds = Int(Date().timeIntervalSince(start))
+            }
+        }
+        refreshOverlay()
+    }
+
+    private func clearTakeState() {
+        isRecording = false
+        timer?.invalidate()
+        timer = nil
+        recordingStart = nil
+        elapsedSeconds = 0
+    }
+
+    func cancelRecording() async {
+        guard isRecording && !isBusy && !isShuttingDown else { return }
+        isBusy = true
+        defer {
+            clearTakeState()
+            releaseOutputFolder()
+            isBusy = false
+        }
+        do {
+            try await engine.discardRecording()
+            notice = "Take discarded. Preview is ready for another recording."
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func restartRecording() async {
+        guard isRecording && !isBusy && !isShuttingDown, let folder = outputFolder else { return }
+        isBusy = true
+        defer {
+            if !isRecording { releaseOutputFolder() }
+            isBusy = false
+        }
+        do {
+            // Keep folder access and capture inputs alive across both writers.
+            // Discard targets only the active unfinished take, never lastRecording.
+            do { try await engine.discardRecording() }
+            catch { clearTakeState(); throw error }
+            clearTakeState()
+            guard !isShuttingDown else { return }
+            try await startTake(in: folder)
+            notice = "New take started. The previous take was discarded."
+        } catch {
+            errorMessage = error.localizedDescription
         }
     }
 
@@ -682,13 +749,9 @@ final class RecorderModel {
         guard isRecording && !isBusy else { return }
         isBusy = true
         defer {
-            isRecording = false
-            isBusy = false
-            timer?.invalidate()
-            timer = nil
-            recordingStart = nil
+            clearTakeState()
             releaseOutputFolder()
-            refreshOverlay()
+            isBusy = false
         }
         do {
             if let url = try await engine.stopRecording() {
@@ -811,12 +874,13 @@ final class RecorderModel {
             guides: showsGuides, recording: isRecording,
             guideBottomInset: layout == .stacked ? 0.08 : guideBottomInset,
             label: hasTwoRegions ? regionTitle(.primary) : nil, accent: .systemCyan,
-                isSelected: selectedRegion == .primary)
+                isSelected: selectedRegion == .primary, busy: isBusy)
         } else { overlay.hide() }
         if hasTwoRegions && !isCameraRegion(.secondary) {
             secondaryOverlay.update(frame: secondaryCaptureFrame, displayFrame: display.visibleFrame,
                 guides: showsGuides, recording: isRecording, guideBottomInset: guideBottomInset,
-                label: regionTitle(.secondary), accent: .systemOrange, isSelected: selectedRegion == .secondary)
+                label: regionTitle(.secondary), accent: .systemOrange, isSelected: selectedRegion == .secondary,
+                busy: isBusy)
         } else { secondaryOverlay.hide() }
     }
 

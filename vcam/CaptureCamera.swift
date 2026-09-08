@@ -1,18 +1,28 @@
 @preconcurrency import AVFoundation
 import CoreMedia
 
+protocol CameraCaptureSession: AnyObject, Sendable {
+    func start(deviceID: String, framesPerSecond: Int, sampleQueue: DispatchQueue,
+               onFrame: @escaping @Sendable (CVPixelBuffer) -> Void,
+               onFailure: @escaping @Sendable (String) -> Void) async throws
+    func stop() async
+}
+
 /// One video-only camera session. Its blocking configuration/start/stop operations
 /// never run on the main actor or on the compositor's sample queue.
-final class CaptureCamera: @unchecked Sendable {
+final class CaptureCamera: NSObject, CameraCaptureSession, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
     let session = AVCaptureSession()
     let output = AVCaptureVideoDataOutput()
     private let controlQueue = DispatchQueue(label: "dev.codewithbeto.vcam.camera", qos: .userInitiated)
     private var observers: [NSObjectProtocol] = []
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var rotationObservation: NSKeyValueObservation?
+    private let handlerLock = NSLock()
+    private var frameHandler: (@Sendable (CVPixelBuffer) -> Void)?
+    private var stopped = false // Confined to the control queue; sessions are single-use.
 
-    func start(deviceID: String, framesPerSecond: Int,
-               delegate: AVCaptureVideoDataOutputSampleBufferDelegate, sampleQueue: DispatchQueue,
+    func start(deviceID: String, framesPerSecond: Int, sampleQueue: DispatchQueue,
+               onFrame: @escaping @Sendable (CVPixelBuffer) -> Void,
                onFailure: @escaping @Sendable (String) -> Void) async throws {
         guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else {
             throw Self.error("Enable Camera access for vcam in System Settings, then try again.")
@@ -20,6 +30,7 @@ final class CaptureCamera: @unchecked Sendable {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             controlQueue.async { [self] in
                 do {
+                    guard !stopped else { throw CancellationError() }
                     guard let device = AVCaptureDevice(uniqueID: deviceID), device.isConnected,
                           device.hasMediaType(.video) else {
                         throw Self.error("The selected camera is no longer connected. Choose another camera.")
@@ -40,7 +51,8 @@ final class CaptureCamera: @unchecked Sendable {
                         // The delegate writes one latest-frame slot on the compositor
                         // queue. AVFoundation discards queued late camera frames.
                         output.alwaysDiscardsLateVideoFrames = true
-                        output.setSampleBufferDelegate(delegate, queue: sampleQueue)
+                        handlerLock.lock(); frameHandler = onFrame; handlerLock.unlock()
+                        output.setSampleBufferDelegate(self, queue: sampleQueue)
                         if let connection = output.connection(with: .video) {
                             if connection.isVideoMirroringSupported {
                                 connection.automaticallyAdjustsVideoMirroring = false
@@ -82,7 +94,7 @@ final class CaptureCamera: @unchecked Sendable {
                     })
                     observers.append(NotificationCenter.default.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification,
                         object: device, queue: nil) { _ in
-                        onFailure("The selected camera was disconnected. The recording has been interrupted.")
+                        onFailure("The selected camera was disconnected. Screen recording can continue without it.")
                     })
                     session.startRunning()
                     guard session.isRunning else { throw Self.error("The camera did not start. Check its connection and Camera access for vcam.") }
@@ -97,8 +109,15 @@ final class CaptureCamera: @unchecked Sendable {
 
     func stop() async {
         await withCheckedContinuation { continuation in
-            controlQueue.async { [self] in cleanup(); continuation.resume() }
+            controlQueue.async { [self] in stopped = true; cleanup(); continuation.resume() }
         }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sample: CMSampleBuffer, from connection: AVCaptureConnection) {
+        guard CMSampleBufferIsValid(sample), CMSampleBufferDataIsReady(sample),
+              let buffer = CMSampleBufferGetImageBuffer(sample) else { return }
+        handlerLock.lock(); let handler = frameHandler; handlerLock.unlock()
+        handler?(buffer) // Already on the compositor's serial queue; never enqueue every frame again.
     }
 
     private func applyRotation(_ angle: CGFloat, to connection: AVCaptureConnection) {
@@ -108,6 +127,7 @@ final class CaptureCamera: @unchecked Sendable {
     }
 
     private func cleanup() {
+        handlerLock.lock(); frameHandler = nil; handlerLock.unlock()
         rotationObservation?.invalidate()
         rotationObservation = nil
         rotationCoordinator = nil

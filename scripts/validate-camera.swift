@@ -47,6 +47,14 @@ struct ValidateCamera {
         states.append((.stacked, configuration))
         configuration.placement = .off
         states.append((.single, configuration))
+        configuration.placement = .regionA
+        states.append((.stacked, configuration))
+        configuration.placement = .off
+        states.append((.sideBySide, configuration))
+        configuration.placement = .overlay
+        states.append((.single, configuration))
+        configuration.placement = .off
+        states.append((.single, configuration))
         let compositions = states.map { CaptureComposition(layout: $0.0, primaryFrame: primary, secondaryFrame: secondary) }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("vcam-camera-validation-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -117,7 +125,7 @@ struct ValidateCamera {
         try check(images[2].pixel(expansionPoint).max()! - images[2].pixel(expansionPoint).min()! < 8,
                   "Resizing overlay must cover the newly included screen pixels with the grayscale camera")
         try await validateAudioAndTiming(asset, video: video[0], audio: audio[0])
-        print("PASS: 1440×2560 camera circle/rounded mask, move/resize, one mirror, Rec.709 NV12 color conversion, single/dual overlays, A/B replacement in both dual layouts, and independent mono AAC.")
+        print("PASS: 1440×2560 camera circle/rounded mask, move/resize, one mirror, Rec.709 NV12 color conversion, live Off/On, single/dual layouts and A/B replacement on one monotonic writer timeline, released camera providers, and independent mono AAC.")
         print("Synthetic camera recording: \(result.url.path)")
     }
 
@@ -201,6 +209,8 @@ struct ValidateCamera {
             if CMSampleBufferGetNumSamples(sample) > 0 { frameTimes.append(CMSampleBufferGetPresentationTimeStamp(sample).seconds) }
         }
         try check(videoReader.status == .completed && frameTimes.count > 100, "Camera movie is incomplete")
+        try check(zip(frameTimes, frameTimes.dropFirst()).allSatisfy { $1 > $0 },
+                  "Live camera/layout changes must preserve strictly increasing presentation timestamps")
         let frameRate = Double(frameTimes.count - 1) / (frameTimes.last! - frameTimes.first!)
         try check(frameRate > 27 && frameRate < 33, "Camera compositor missed its 30 fps cadence: \(frameRate)")
         let audioDescription = try await audio.load(.formatDescriptions)[0]

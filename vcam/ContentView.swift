@@ -2,25 +2,31 @@ import SwiftUI
 
 struct ContentView: View {
     @Bindable var model: RecorderModel
+    @State private var panel: ControlPanel = .live
     @State private var widthText = ""
     @State private var heightText = ""
     @FocusState private var dimensionFocus: Dimension?
     private enum Dimension { case width, height }
+    private enum ControlPanel: String, CaseIterable, Identifiable {
+        case live = "Live", setup = "Setup"
+        var id: String { rawValue }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            HStack(alignment: .top, spacing: 24) {
-                preview
-                ScrollView { settings.padding(.trailing, 4) }
-                    .frame(height: 540)
+            HStack(spacing: 0) {
+                preview.padding(20)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                sidebar.frame(width: 390)
             }
-            .padding(24)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
             footer
         }
-        .frame(width: 870)
+        .frame(minWidth: 900, minHeight: 700)
         .background(.background)
         .task { model.prepare(); syncDimensions(); model.commitFrameEdits = { commitDimensions() } }
         .onDisappear { model.commitFrameEdits = nil }
@@ -29,6 +35,10 @@ struct ContentView: View {
         .onChange(of: dimensionFocus) { previous, _ in
             if previous == .width { applyWidth() }
             if previous == .height { applyHeight() }
+        }
+        .onChange(of: panel) { _, _ in commitDimensions(); dimensionFocus = nil }
+        .onChange(of: model.isRecording) { _, recording in
+            if recording { panel = .live }
         }
         .sheet(isPresented: $model.showOnboarding) { PermissionSetupView(model: model) }
         .alert("vcam needs your attention", isPresented: Binding(
@@ -42,50 +52,79 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Image(systemName: "viewfinder").font(.system(size: 24, weight: .medium)).foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 2) {
+            Image(systemName: "viewfinder").font(.system(size: 23, weight: .medium)).foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 3) {
                 Text("vcam").font(.system(size: 21, weight: .semibold, design: .rounded))
-                Text("A camera for your screen").font(.callout).foregroundStyle(.secondary)
+                Text("\(model.outputDimensions) · \(model.framesPerSecond) fps")
+                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             Spacer()
             Button { model.refreshPermissions(); model.showOnboarding = true } label: {
-                Label(model.permissionsReady ? "Access ready" : "Set up access", systemImage: model.permissionsReady ? "checkmark.shield" : "lock.open")
+                Label(model.permissionsReady ? "Access ready" : "Set up access",
+                      systemImage: model.permissionsReady ? "checkmark.shield" : "lock.open")
             }
             .disabled(model.isRecording || model.isBusy)
-            HStack(spacing: 7) {
-                Circle().fill(model.isRecording ? Color.red : model.isPreviewing ? Color.green : Color.secondary).frame(width: 7, height: 7)
-                Text(model.statusText).font(.callout.monospacedDigit())
+            HStack(spacing: 8) {
+                Circle().fill(model.isRecording ? Color.red : model.isPreviewing ? Color.green : Color.secondary)
+                    .frame(width: 8, height: 8)
+                Text(model.isRecording ? "Recording  \(model.elapsedText)" : model.statusText)
+                    .font(.callout.monospacedDigit())
+                if model.isBusy && model.isRecording { ProgressView().controlSize(.small) }
             }
-            .padding(.horizontal, 12).padding(.vertical, 7)
+            .padding(.horizontal, 14).padding(.vertical, 8)
             .background(.quaternary.opacity(0.5), in: Capsule())
+            .accessibilityElement(children: .combine)
         }
-        .padding(.horizontal, 24).padding(.vertical, 18)
+        .padding(.horizontal, 24).padding(.vertical, 16)
     }
 
     private var preview: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Output preview").font(.callout.weight(.medium))
-                SettingHelp("Output preview", "A live view of what will be saved. The native video preview refreshes at up to 30 fps. Guides and vcam controls never appear in the recording.")
+                Text("Output preview").font(.callout.weight(.semibold))
+                SettingHelp("Output preview", "Resize this window to enlarge the preview. The saved dimensions and on-screen capture frames stay unchanged. The native preview refreshes at up to 30 fps. Guides and vcam controls are never recorded.")
                 Spacer()
-                Text(model.orientation.ratioLabel).font(.caption.monospaced()).foregroundStyle(.secondary)
+                Button(model.isFrameVisible ? "Hide frames" : "Show frames") { model.toggleFrame() }
+                    .controlSize(.small).disabled(model.isRecording || model.isBusy)
+                    .help("Show or hide capture frames: Shift-Command-F")
             }
-            ZStack {
-                Color(nsColor: .underPageBackgroundColor)
-                CameraPreview(surface: model.previewSurface).opacity(model.isPreviewing ? 1 : 0)
-                if !model.isPreviewing {
-                    VStack(spacing: 14) {
-                        Image(systemName: "rectangle.portrait.dashed").font(.system(size: 38, weight: .ultraLight)).foregroundStyle(.secondary)
-                        Text("Frame your next take").font(.headline)
-                        Text("Place your frames over any app.\nStart preview to see your shot.")
-                            .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        Button(model.hasTwoRegions ? "Show frames" : "Show frame") { model.showFrame() }.disabled(model.isBusy)
-                    }.padding(14)
+            GeometryReader { geometry in
+                let aspect = model.outputSize.width / max(model.outputSize.height, 1)
+                let width = max(1, min(geometry.size.width, geometry.size.height * aspect))
+                previewCanvas
+                    .frame(width: width, height: width / aspect)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.white.opacity(0.12)))
+                    .shadow(color: .black.opacity(0.15), radius: 12, y: 5)
+                    .position(x: geometry.size.width / 2, y: geometry.size.height / 2)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .underPageBackgroundColor), in: RoundedRectangle(cornerRadius: 16))
+            Text(previewHint)
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var previewCanvas: some View {
+        ZStack {
+            Color.black
+            CameraPreview(surface: model.previewSurface).opacity(model.isPreviewing ? 1 : 0)
+            if !model.isPreviewing {
+                VStack(spacing: 14) {
+                    Image(systemName: model.orientation == .portrait ? "rectangle.portrait.dashed" : "rectangle.dashed")
+                        .font(.system(size: 40, weight: .ultraLight))
+                    Text("Frame your next take").font(.headline)
+                    Text("Place your frames over any app.\nStart preview to see your shot.")
+                        .font(.callout).multilineTextAlignment(.center)
                 }
+                .foregroundStyle(.white.opacity(0.7)).padding(20)
             }
-            .frame(width: 256, height: model.orientation == .portrait ? 455 : 256 * 9 / 16)
-            .overlay {
-                if model.isPreviewing {
+        }
+        .overlay {
+            if model.isPreviewing {
+                ZStack {
                     CompositionDivider(layout: model.layout,
                         splitRatio: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
                         isEnabled: !model.isBusy)
@@ -96,169 +135,226 @@ struct ContentView: View {
                     }
                 }
             }
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.primary.opacity(0.10)))
-            .accessibilityElement(children: .contain)
-            .accessibilityLabel(model.isPreviewing ? "Live video preview" : "Preview is off")
-            Text(model.outputDimensions + " output pixels").font(.caption.monospacedDigit())
-            Text(model.cameraPlacement == .overlay
-                 ? "Drag your camera to move it, or drag its corner to resize. Placement changes are recorded."
-                 : model.hasTwoRegions ? "Both regions are saved in one video. Drag the preview divider to adjust the split, even while recording." : "Guides are only for you. The full frame is recorded.")
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        }.frame(width: 256)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(model.isPreviewing ? "Live video preview" : "Preview is off")
     }
 
-    private var settings: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text("Display").frame(width: 90, alignment: .leading)
-                Picker("Display", selection: Binding(get: { model.selectedDisplayID }, set: { model.selectDisplay($0) })) {
-                    ForEach(model.displays) { display in Text(display.name).tag(display.id) }
-                }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
-                SettingHelp("Display", "Choose the display to capture. Both regions can move independently anywhere inside this display. Stop preview before switching displays.")
+    private var previewHint: String {
+        if model.cameraPlacement == .overlay {
+            return "Drag the camera to move it; use its corner to resize. \(model.hasTwoRegions ? "Drag the divider to adjust the split." : "Changes appear in your take.")"
+        }
+        return model.hasTwoRegions
+            ? "Drag the divider to adjust the split. Move each capture frame independently on your display."
+            : "The full capture frame is recorded. Resize this window for a larger preview."
+    }
+
+    private var sidebar: some View {
+        VStack(spacing: 0) {
+            Picker("Controls", selection: $panel) {
+                ForEach(ControlPanel.allCases) { Text($0.rawValue).tag($0) }
             }
-            HStack {
-                Text("Orientation").frame(width: 90, alignment: .leading)
+            .pickerStyle(.segmented).labelsHidden().padding(20)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    Text(panel == .live ? "Adjust your composition before or during a take." : "Choose your sources and recording format.")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if panel == .live {
+                        liveSettings
+                    } else {
+                        setupSettings
+                    }
+                }
+                .padding(.horizontal, 20).padding(.bottom, 24)
+            }
+            .scrollIndicators(.automatic)
+        }
+        .background(.quaternary.opacity(0.12))
+    }
+
+    private var liveSettings: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            compositionSettings
+            Divider()
+            frameSettings
+            Divider()
+            CameraSettingsView(model: model, section: .live)
+        }
+    }
+
+    private var compositionSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            settingTitle("Layout", help: "Single records one region. Side by side places A left and B right. Stacked places A above B. Switch layouts during a take; the saved video keeps the same resolution and orientation.")
+            Picker("Composition layout", selection: Binding(get: { model.layout }, set: { model.setLayout($0) })) {
+                Text("Single").tag(CaptureLayout.single)
+                Text("Side by side").tag(CaptureLayout.sideBySide)
+                Text("Stacked").tag(CaptureLayout.stacked)
+            }.labelsHidden().pickerStyle(.segmented).disabled(model.isBusy)
+            if model.hasTwoRegions {
+                VStack(spacing: 8) {
+                    HStack {
+                        Text("Split").font(.callout)
+                        SettingHelp("Split", "Give either region 15% to 85% of the output. Drag the preview divider or use this slider, including during a take. Source frames resize to match without stretching. The divider itself is not recorded.")
+                        Spacer()
+                        Text(model.splitDescription).font(.caption.monospacedDigit())
+                        Button("50/50") { model.setSplitRatio(0.5) }.controlSize(.small)
+                    }
+                    Slider(value: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }), in: 0.15...0.85)
+                        .accessibilityLabel("Region A share of output").accessibilityValue(model.splitDescription)
+                }.disabled(model.isBusy)
+            }
+        }
+    }
+
+    private var frameSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            settingTitle("Capture region", help: "Select a region to change how much of your display it captures. Drag its floating handle on screen to move it. Each handle also has horizontal and vertical movement locks. These changes work during recording.")
+            if model.hasTwoRegions {
+                Picker("Edit region", selection: Binding(get: { model.selectedRegion }, set: { model.selectRegion($0) })) {
+                    ForEach(CaptureRegion.allCases) { Text(model.regionTitle($0)).tag($0) }
+                }.labelsHidden().pickerStyle(.segmented).disabled(model.isBusy)
+            }
+            if model.activeRegionIsCamera {
+                Label("Camera fills \(model.regionTitle(model.selectedRegion))", systemImage: "video.fill")
+                    .font(.callout.weight(.medium))
+                Text("Use the split to resize this panel. The camera is cropped to fill without stretching.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                HStack {
+                    Text("Frame size").font(.callout)
+                    SettingHelp("Frame size and points", "Points (pt) measure the captured region on your Mac, not output resolution. On a 2× Retina display, 540 × 960 pt contains 1080 × 1920 source pixels. Width and height stay linked to this region's output shape. Larger frames show more content; smaller frames magnify it.")
+                    Spacer()
+                    Text(model.activeAspectLabel).font(.caption).foregroundStyle(.secondary)
+                }
+                HStack(spacing: 8) {
+                    Text("W").foregroundStyle(.secondary)
+                    TextField("Width", text: $widthText).focused($dimensionFocus, equals: .width).onSubmit { applyWidth() }
+                        .accessibilityLabel("Frame width in screen points")
+                    Text("×").foregroundStyle(.secondary)
+                    Text("H").foregroundStyle(.secondary)
+                    TextField("Height", text: $heightText).focused($dimensionFocus, equals: .height).onSubmit { applyHeight() }
+                        .accessibilityLabel("Frame height in screen points")
+                    Text("pt").foregroundStyle(.secondary)
+                }.disabled(model.isBusy)
+                Slider(value: Binding(get: { model.frameWidth }, set: { model.setFrameWidth($0) }),
+                       in: model.minimumFrameWidth...max(model.minimumFrameWidth, model.maximumFrameWidth), step: 2)
+                    .accessibilityLabel("Recording frame size").disabled(model.isBusy)
+                Label(model.sourceSizeText + (model.isUpscaling ? " · scaled up" : ""),
+                      systemImage: model.isUpscaling ? "arrow.up.right" : "checkmark.circle")
+                    .font(.caption).foregroundStyle(model.isUpscaling ? Color.orange : Color.secondary)
+            }
+        }
+    }
+
+    private var setupSettings: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            if model.isRecording || model.isPreviewing {
+                Label(model.isRecording ? "Finish the take to change recording format or devices." : "Stop preview to change display, output, audio, or cursor.",
+                      systemImage: "info.circle")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            outputSettings
+            Divider()
+            CameraSettingsView(model: model, section: .setup)
+            Divider()
+            microphoneSettings
+            Divider()
+            guideSettings
+            Divider()
+            folderSettings
+        }
+    }
+
+    private var outputSettings: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Recording format").font(.headline)
+            VStack(alignment: .leading, spacing: 7) {
+                settingTitle("Display", help: "Choose the display to capture. Both screen regions can move independently inside this display. Stop preview before switching displays.", prominent: false)
+                Picker("Display", selection: Binding(get: { model.selectedDisplayID }, set: { model.selectDisplay($0) })) {
+                    ForEach(model.displays) { Text($0.name).tag($0.id) }
+                }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                settingTitle("Orientation", help: "Portrait is 9:16; landscape is 16:9. This sets the shape of the saved video. Stop recording before changing orientation.", prominent: false)
                 Picker("Orientation", selection: Binding(get: { model.orientation }, set: { value in Task { await model.setOrientation(value) } })) {
                     ForEach(CaptureOrientation.allCases) { Text($0.title + " " + $0.ratioLabel).tag($0) }
                 }.labelsHidden().pickerStyle(.segmented).disabled(model.isRecording || model.isBusy)
-                SettingHelp("Orientation", "Portrait is 9:16 for vertical videos. Landscape is 16:9. Changing orientation reshapes the frame and swaps the output dimensions. Stop recording before changing it.")
             }
-            HStack {
-                Text("Output").frame(width: 90, alignment: .leading)
+            VStack(alignment: .leading, spacing: 7) {
+                settingTitle("Output resolution", help: "The dimensions of the saved video, in pixels. 2K here means 1440p: 1440 × 2560 in portrait. It preserves more detail when the capture region contains enough source pixels, with larger files and more GPU work.", prominent: false)
                 Picker("Resolution", selection: $model.resolution) {
                     ForEach(OutputResolution.allCases) { resolution in
                         let size = resolution.size(for: model.orientation)
-                        Text("\(resolution.title)  ·  \(Int(size.width)) × \(Int(size.height))").tag(resolution)
+                        Text("\(resolution.title) · \(Int(size.width)) × \(Int(size.height))").tag(resolution)
                     }
                 }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
-                SettingHelp("Output resolution", "The dimensions of the saved video, in pixels. Here 2K means 1440p: 1440 × 2560 in portrait. It stores more detail when the captured area has enough source pixels, with more GPU work and larger files.")
             }
-            HStack {
-                Text("Frame rate").frame(width: 90, alignment: .leading)
+            VStack(alignment: .leading, spacing: 7) {
+                settingTitle("Frame rate", help: "30 fps is the default for screen demos. 60 fps records smoother motion with more processing and storage. The live preview refreshes at up to 30 fps.", prominent: false)
                 Picker("Frame rate", selection: $model.framesPerSecond) {
                     Text("30 fps · default").tag(30)
                     Text("60 fps · smoother motion").tag(60)
                 }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
-                SettingHelp("Frame rate", "30 frames per second is the default for ordinary screen demos. 60 fps records smoother fast scrolling and motion, using more processing and storage. Preview is capped at 30 fps.")
             }
-            Divider()
-            compositionSettings
-            Divider()
-            CameraSettingsView(model: model)
-            Divider()
-            VStack(alignment: .leading, spacing: 8) {
-                if model.hasTwoRegions {
-                    HStack {
-                        Text("Edit region").frame(width: 90, alignment: .leading)
-                        Picker("Edit region", selection: Binding(get: { model.selectedRegion }, set: { model.selectRegion($0) })) {
-                            ForEach(CaptureRegion.allCases) { Text(model.regionTitle($0)).tag($0) }
-                        }.labelsHidden().pickerStyle(.segmented).disabled(model.isBusy)
-                        SettingHelp("Edit region", "Blue A is the left or top view; orange B is the right or bottom view. Select a region to change its capture size, or drag its handle on screen to move it independently. Each handle has its own horizontal and vertical movement lock.")
-                    }
-                }
-                if model.activeRegionIsCamera {
-                    Label("Camera fills \(model.regionTitle(model.selectedRegion))", systemImage: "video.fill")
-                        .font(.callout.weight(.medium))
-                    Text("Use the split to resize this panel. The camera is cropped to fill without stretching.")
-                        .font(.caption).foregroundStyle(.secondary)
-                } else {
-                    HStack {
-                        Text(model.hasTwoRegions ? "\(model.regionTitle(model.selectedRegion)) size" : "Frame size").font(.callout.weight(.medium))
-                        SettingHelp("Frame size and points", "Points (pt) measure the region's size on your Mac, not the saved video's resolution. On a 2× Retina display, 540 × 960 pt contains 1080 × 1920 source pixels. Width and height stay linked to this region's part of the output, so content keeps its shape. Larger frames fit more content; smaller ones magnify it.")
-                        Spacer()
-                        Text(model.activeAspectLabel).font(.caption).foregroundStyle(.secondary)
-                    }
-                    HStack(spacing: 8) {
-                        Text("W").foregroundStyle(.secondary)
-                        TextField("Width", text: $widthText).frame(width: 74).focused($dimensionFocus, equals: .width).onSubmit { applyWidth() }
-                            .accessibilityLabel("Frame width in screen points")
-                        Text("×").foregroundStyle(.secondary)
-                        Text("H").foregroundStyle(.secondary)
-                        TextField("Height", text: $heightText).frame(width: 74).focused($dimensionFocus, equals: .height).onSubmit { applyHeight() }
-                            .accessibilityLabel("Frame height in screen points")
-                        Text("pt").foregroundStyle(.secondary)
-                        Slider(value: Binding(get: { model.frameWidth }, set: { model.setFrameWidth($0) }),
-                               in: model.minimumFrameWidth...max(model.minimumFrameWidth, model.maximumFrameWidth), step: 2)
-                            .accessibilityLabel("Recording frame size")
-                    }.disabled(model.isRecording || model.isBusy)
-                    HStack(spacing: 5) {
-                        Image(systemName: model.isUpscaling ? "arrow.up.right" : "checkmark.circle")
-                        Text(model.sourceSizeText + (model.isUpscaling ? " · scaled up to \(model.hasTwoRegions ? "panel" : "output")" : ""))
-                    }.font(.caption).foregroundStyle(model.isUpscaling ? Color.orange : Color.secondary)
-                }
-            }
-            Divider()
+        }
+    }
+
+    private var microphoneSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            settingTitle("Microphone", help: "Choose your microphone or audio interface. Start preview and speak to check the meter at the bottom of this window. Camera and microphone selections are independent.")
             HStack {
-                Text("Microphone").frame(width: 90, alignment: .leading)
                 Picker("Microphone", selection: $model.selectedMicrophoneID) {
                     Text("No microphone").tag("")
                     ForEach(model.microphones) { Text($0.name).tag($0.id) }
-                }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
+                }.labelsHidden()
                     .onChange(of: model.selectedMicrophoneID) { _, _ in model.microphoneChannel = -1; model.refreshPermissions() }
                 Button { model.refreshDevices() } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).accessibilityLabel("Refresh microphones").disabled(model.isPreviewing || model.isBusy)
-                SettingHelp("Microphone", "Choose your physical microphone or audio interface. Start preview and speak to check the meter before recording. Screen access and microphone access are separate permissions.")
-            }
+                    .buttonStyle(.borderless).accessibilityLabel("Refresh microphones")
+            }.disabled(model.isPreviewing || model.isBusy)
             if model.microphoneChannels > 1 && !model.selectedMicrophoneID.isEmpty {
-                HStack {
-                    Text("Input channel").frame(width: 90, alignment: .leading)
-                    Picker("Input channel", selection: $model.microphoneChannel) {
-                        Text("Auto · inputs 1–2").tag(-1)
-                        ForEach(0..<model.microphoneChannels, id: \.self) { Text("Input \($0 + 1)").tag($0) }
-                    }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
-                    SettingHelp("Input channel", "Audio interfaces can expose several inputs. Choose the one your microphone is plugged into. Auto uses the strongest of the first two inputs and locks that choice for the take. On the Scarlett, channels 3–4 are loopback channels.")
-                }
-            }
-            HStack(spacing: 9) {
-                AudioMeter(level: model.audioLevel)
-                Text(model.selectedMicrophoneID.isEmpty ? "Mic off" : model.isPreviewing ? model.decibelText : "Preview to test")
-                    .font(.caption.monospacedDigit()).frame(minWidth: 86, alignment: .trailing)
-                SettingHelp("Peak level · dBFS", "This shows the microphone's digital peak level, not room loudness. 0 dBFS is the maximum and can clip. A value near −∞ means no input signal. Check the selected input channel if the meter does not move when you speak.")
+                settingTitle("Input channel", help: "Choose the input your microphone uses. Auto selects the strongest of the first two channels and locks that choice for the take. On the Scarlett, inputs 3–4 are loopback channels.", prominent: false)
+                Picker("Input channel", selection: $model.microphoneChannel) {
+                    Text("Auto · inputs 1–2").tag(-1)
+                    ForEach(0..<model.microphoneChannels, id: \.self) { Text("Input \($0 + 1)").tag($0) }
+                }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
             }
             if model.isPreviewing, model.microphoneChannels > 1, let channel = model.activeMicrophoneChannel {
                 Text("Listening to input \(channel + 1)").font(.caption).foregroundStyle(.secondary)
             }
-            Divider()
-            HStack {
-                Toggle("Edge guides", isOn: $model.showsGuides).toggleStyle(.switch).controlSize(.small)
-                SettingHelp("Edge guides", "A small 8% margin on each side helps keep important details away from platform controls and device cropping. Everything inside the outer recording frame is saved, including the shaded margins. These are general composition guides, not guaranteed platform safe zones.")
-                Toggle("Reserve caption space", isOn: $model.reservesCaptions).toggleStyle(.switch).controlSize(.small).disabled(!model.showsGuides)
-                SettingHelp("Caption space", "Optionally reserve the lower 20% for subtitles or platform labels. This is a visual reminder only. No content is removed from the recording.")
-            }
-            HStack {
-                Toggle("Show cursor", isOn: $model.showsCursor).toggleStyle(.switch).controlSize(.small).disabled(model.isPreviewing || model.isBusy)
-                SettingHelp("Cursor", "Include your mouse pointer in the video. The floating frame and its controls remain excluded. Stop preview before changing this setting.")
-                Spacer()
-                Image(systemName: "folder").foregroundStyle(.secondary)
-                Text(model.outputFolder?.lastPathComponent ?? "Save folder").lineLimit(1).help(model.outputFolder?.path ?? "Choose an output folder")
-                Button(model.outputFolder == nil ? "Choose…" : "Change…") { model.chooseOutputFolder() }.disabled(model.isRecording || model.isBusy)
-                SettingHelp("Save folder", "Choose where recordings are saved. vcam remembers permission for this folder. Each take gets a unique filename and opens in QuickTime Player after saving. Use Play to reopen it or Reveal to find the file.")
-            }
-            if model.isPreviewing && !model.isRecording {
-                Text("Stop preview to change output, frame rate, microphone, or cursor.").font(.caption).foregroundStyle(.secondary)
-            }
-        }.frame(maxWidth: .infinity, alignment: .leading).controlSize(.regular)
+        }
     }
 
-    private var compositionSettings: some View {
-        VStack(alignment: .leading, spacing: 8) {
+    private var guideSettings: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Guides & cursor").font(.headline)
             HStack {
-                Text("Layout").frame(width: 90, alignment: .leading)
-                CompositionLayoutPicker(selection: Binding(get: { model.layout }, set: { model.setLayout($0) }),
-                    isEnabled: !model.isRecording && !model.isBusy)
-                SettingHelp("Layout", "Single records one region. Side by side places A on the left and B on the right. Stacked places A above B. Two movable frames capture separate parts of the same display into one video. Stop recording before changing layouts.")
+                Toggle("Edge guides", isOn: $model.showsGuides)
+                SettingHelp("Edge guides", "An 8% side margin helps keep important details clear of platform controls and device cropping. The full outer frame is saved, including shaded areas. These are composition guides, not guaranteed platform safe zones.")
             }
-            if model.hasTwoRegions {
-                HStack {
-                    Text("Split").frame(width: 90, alignment: .leading)
-                    Slider(value: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }), in: 0.15...0.85)
-                        .accessibilityLabel("Region A share of output")
-                        .accessibilityValue(model.splitDescription)
-                    Text(model.splitDescription).font(.caption.monospacedDigit()).frame(width: 110)
-                    Button("50/50") { model.setSplitRatio(0.5) }
-                    SettingHelp("Split", "Give either region 15% to 85% of the output. Drag the divider in the live preview or use this slider, including during recording. Source frames resize around their centers to match, with no stretching. The divider and region labels are guides only and are not saved.")
-                }.disabled(model.isBusy)
+            HStack {
+                Toggle("Reserve caption space", isOn: $model.reservesCaptions).disabled(!model.showsGuides)
+                SettingHelp("Caption space", "Reserve the lower 20% for subtitles or platform labels. This is only a visual reminder; no content is removed.")
+            }
+            HStack {
+                Toggle("Show cursor", isOn: $model.showsCursor).disabled(model.isPreviewing || model.isBusy)
+                SettingHelp("Cursor", "Include your mouse pointer in the saved video. Capture frames and vcam controls stay excluded. Stop preview before changing this setting.")
+            }
+        }.toggleStyle(.switch).controlSize(.small)
+    }
+
+    private var folderSettings: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            settingTitle("Save folder", help: "Each take gets a unique filename and opens in QuickTime Player after saving. vcam remembers access to this folder. Finish the current take before changing it.")
+            HStack {
+                Image(systemName: "folder").foregroundStyle(.secondary)
+                Text(model.outputFolder?.lastPathComponent ?? "Choose a folder")
+                    .lineLimit(1).truncationMode(.middle).help(model.outputFolder?.path ?? "Choose an output folder")
+                Spacer()
+                Button(model.outputFolder == nil ? "Choose…" : "Change…") { model.chooseOutputFolder() }
+                    .disabled(model.isRecording || model.isBusy)
             }
         }
     }
@@ -269,25 +365,62 @@ struct ContentView: View {
                 HStack {
                     Text(notice).font(.caption).lineLimit(2)
                     Spacer()
-                    if model.lastRecording != nil {
+                    if model.lastRecording != nil && !model.isRecording {
                         Button("Play") { model.openLastRecording() }
                         Button("Reveal") { model.revealLastRecording() }
                     }
+                }.controlSize(.small)
+            }
+            HStack(spacing: 16) {
+                microphoneMonitor
+                Spacer(minLength: 16)
+                if model.isRecording {
+                    Button("Cancel take", role: .destructive) { Task { await model.cancelRecording() } }
+                        .help("Discard this take and return to preview. No video from this take is saved.")
+                    Button { Task { await model.restartRecording() } } label: {
+                        Label("Restart take", systemImage: "arrow.counterclockwise")
+                    }.help("Discard this take and immediately start a new recording.")
+                    Button { Task { await model.finishRecording() } } label: {
+                        Label("Finish", systemImage: "stop.fill").frame(minWidth: 78)
+                    }
+                    .buttonStyle(.borderedProminent).tint(.red)
+                    .help("Save this take and open it in QuickTime Player. Shift-Command-R")
+                } else {
+                    Button(model.isPreviewing ? "Stop preview" : "Start preview") { Task { await model.togglePreview() } }
+                        .disabled(model.displays.isEmpty)
+                    Button { Task { await model.toggleRecording() } } label: {
+                        Label("Record", systemImage: "record.circle").frame(minWidth: 78)
+                    }
+                    .buttonStyle(.borderedProminent).disabled(model.displays.isEmpty)
+                    .help("Start a recording: Shift-Command-R")
                 }
             }
-            HStack(spacing: 10) {
-                Button(model.isFrameVisible ? (model.hasTwoRegions ? "Hide frames" : "Hide frame") : (model.hasTwoRegions ? "Show frames" : "Show frame")) { model.toggleFrame() }.disabled(model.isRecording || model.isBusy)
-                Text("⇧⌘F").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button(model.isPreviewing ? "Stop preview" : "Start preview") { Task { await model.togglePreview() } }
-                    .disabled(model.isRecording || model.isBusy || model.displays.isEmpty)
-                Button { Task { await model.toggleRecording() } } label: {
-                    Label(model.isRecording ? "Stop & save" : "Record", systemImage: model.isRecording ? "stop.fill" : "record.circle").frame(minWidth: 112)
-                }.buttonStyle(.borderedProminent).tint(model.isRecording ? .red : .accentColor)
-                    .disabled(model.isBusy || model.displays.isEmpty).help("Record or stop: Shift-Command-R")
-                Text("⇧⌘R").font(.caption).foregroundStyle(.secondary)
-            }
+            .controlSize(.large).disabled(model.isBusy)
         }.padding(.horizontal, 24).padding(.vertical, 16)
+    }
+
+    private var microphoneMonitor: some View {
+        HStack(spacing: 10) {
+            Image(systemName: model.selectedMicrophoneID.isEmpty ? "mic.slash" : "mic")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text(model.selectedMicrophoneID.isEmpty ? "Mic off" : model.isPreviewing ? model.decibelText : "Preview to test")
+                        .font(.caption.monospacedDigit())
+                    Spacer(minLength: 4)
+                    SettingHelp("Peak level · dBFS", "This meter shows the microphone's digital peak level. 0 dBFS is the maximum and can clip. A reading near −∞ means no signal. Check your microphone and input channel in Setup if speaking does not move the meter.")
+                }
+                AudioMeter(level: model.audioLevel)
+            }.frame(width: 180)
+        }
+    }
+
+    private func settingTitle(_ title: String, help: String, prominent: Bool = true) -> some View {
+        HStack(spacing: 7) {
+            Text(title).font(prominent ? .headline : .callout)
+            SettingHelp(title, help)
+            Spacer(minLength: 0)
+        }
     }
 
     private func syncDimensions(force: Bool = false) {

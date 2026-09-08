@@ -5,6 +5,8 @@ import AppKit
 final class FrameOverlayController {
     var onFrameChanged: ((CGRect) -> Void)?
     var onToggleRecording: (() -> Void)?
+    var onCancelRecording: (() -> Void)?
+    var onRestartRecording: (() -> Void)?
     var onHide: (() -> Void)?
     var onMotionModeChanged: ((String) -> Void)?
     var onSelect: (() -> Void)?
@@ -20,6 +22,7 @@ final class FrameOverlayController {
     private var frame = CGRect.zero
     private var displayFrame = CGRect.zero
     private var recording = false
+    private var controlsBusy = false
     private var dragStartFrame = CGRect.zero
     private var dragStartPoint = CGPoint.zero
     private var motionMode = FrameMotionMode.free
@@ -62,10 +65,19 @@ final class FrameOverlayController {
             self.onFrameChanged?(movedFrame)
         }
         handleView.onToggleRecording = { [weak self] in
-            self?.onToggleRecording?()
+            guard let self, !self.controlsBusy else { return }
+            self.onToggleRecording?()
+        }
+        handleView.onCancelRecording = { [weak self] in
+            guard let self, self.recording, !self.controlsBusy else { return }
+            self.onCancelRecording?()
+        }
+        handleView.onRestartRecording = { [weak self] in
+            guard let self, self.recording, !self.controlsBusy else { return }
+            self.onRestartRecording?()
         }
         handleView.onHide = { [weak self] in
-            guard let self, !self.recording else { return }
+            guard let self, !self.recording, !self.controlsBusy else { return }
             self.onHide?()
         }
         handleView.onMotionModeChanged = { [weak self] mode in
@@ -76,11 +88,12 @@ final class FrameOverlayController {
     }
 
     func show(frame: CGRect, displayFrame: CGRect, guides: Bool, guideBottomInset: CGFloat = 0.08,
-              label: String? = nil, accent: NSColor = .systemCyan, isSelected: Bool = true) {
+              label: String? = nil, accent: NSColor = .systemCyan, isSelected: Bool = true,
+              busy: Bool = false) {
         Self.displayedOverlays.add(self)
         update(frame: frame, displayFrame: displayFrame, guides: guides,
                recording: recording, guideBottomInset: guideBottomInset,
-               label: label, accent: accent, isSelected: isSelected)
+               label: label, accent: accent, isSelected: isSelected, busy: busy)
         // This leaves the user's terminal, browser, or other app focused.
         guideWindow.orderFrontRegardless()
         handleWindow.orderFrontRegardless()
@@ -89,11 +102,12 @@ final class FrameOverlayController {
 
     func update(frame: CGRect, displayFrame: CGRect, guides: Bool, recording: Bool,
                 guideBottomInset: CGFloat = 0.08, label: String? = nil,
-                accent: NSColor = .systemCyan, isSelected: Bool = true) {
+                accent: NSColor = .systemCyan, isSelected: Bool = true, busy: Bool = false) {
         let becameSelected = isSelected && !handleView.isSelected
         self.frame = frame
         self.displayFrame = displayFrame
         self.recording = recording
+        controlsBusy = busy
         guideView.showsGuides = guides
         guideView.isRecording = recording
         guideView.bottomInset = SafeAreaGuide.normalizedBottomInset(guideBottomInset)
@@ -101,6 +115,7 @@ final class FrameOverlayController {
         guideView.accent = accent
         guideView.isSelected = isSelected
         handleView.isRecording = recording
+        handleView.isBusy = busy
         handleView.aspectLabel = SafeAreaGuide.aspectLabel(for: frame.size)
         handleView.identityLabel = label
         handleView.accent = accent
@@ -335,14 +350,20 @@ private enum FrameMotionMode: String {
 @MainActor
 private final class CaptureHandleView: NSView {
     static let preferredSize = CGSize(width: 330, height: 40)
-    var preferredSize: CGSize { CGSize(width: Self.preferredSize.width + dragRegionWidth - 76, height: 40) }
+    var preferredSize: CGSize {
+        CGSize(width: Self.preferredSize.width + dragRegionWidth - 76 + (isRecording ? 18 : 0), height: 40)
+    }
     var onDragBegan: ((CGPoint) -> Void)?
     var onDragMoved: ((CGPoint) -> Void)?
     var onToggleRecording: (() -> Void)?
+    var onCancelRecording: (() -> Void)?
+    var onRestartRecording: (() -> Void)?
     var onHide: (() -> Void)?
     var onMotionModeChanged: ((FrameMotionMode) -> Void)?
 
     private let recordingButton = OverlayButton(title: "Record", target: nil, action: nil)
+    private let cancelButton = OverlayButton(title: "", target: nil, action: nil)
+    private let restartButton = OverlayButton(title: "", target: nil, action: nil)
     private let hideButton = OverlayButton(title: "", target: nil, action: nil)
     private let freeButton = OverlayButton(title: "Free", target: nil, action: nil)
     private let horizontalButton = OverlayButton(title: "", target: nil, action: nil)
@@ -372,7 +393,14 @@ private final class CaptureHandleView: NSView {
     var isRecording = false {
         didSet {
             updateButtons()
+            needsLayout = true
             needsDisplay = true
+        }
+    }
+    var isBusy = false {
+        didSet {
+            updateButtons()
+            updateMotionButtons()
         }
     }
 
@@ -405,6 +433,11 @@ private final class CaptureHandleView: NSView {
         hideButton.setAccessibilityLabel("Hide recording frame")
         addSubview(hideButton)
 
+        configureTakeButton(cancelButton, symbol: "trash", label: "Cancel recording and discard current take",
+                            help: "Cancel: discard the current take and keep preview open", action: #selector(cancelRecording))
+        configureTakeButton(restartButton, symbol: "arrow.counterclockwise", label: "Restart recording and discard current take",
+                            help: "Restart: discard the current take and immediately start a new recording", action: #selector(restartRecording))
+
         configureMotionButton(freeButton, symbol: nil, label: "Move freely", action: #selector(moveFreely))
         configureMotionButton(horizontalButton, symbol: "arrow.left.and.right", label: "Pan horizontally", action: #selector(panHorizontally))
         configureMotionButton(verticalButton, symbol: "arrow.up.and.down", label: "Pan vertically", action: #selector(panVertically))
@@ -427,7 +460,10 @@ private final class CaptureHandleView: NSView {
         freeButton.frame = CGRect(x: 84 + offset, y: 6, width: 38, height: 28)
         horizontalButton.frame = CGRect(x: 128 + offset, y: 6, width: 28, height: 28)
         verticalButton.frame = CGRect(x: 162 + offset, y: 6, width: 28, height: 28)
-        recordingButton.frame = CGRect(x: 200 + offset, y: 6, width: 86, height: 28)
+        recordingButton.frame = CGRect(x: (isRecording ? 268 : 200) + offset, y: 6,
+                                       width: isRecording ? 72 : 86, height: 28)
+        cancelButton.frame = CGRect(x: 200 + offset, y: 6, width: 28, height: 28)
+        restartButton.frame = CGRect(x: 234 + offset, y: 6, width: 28, height: 28)
         hideButton.frame = CGRect(x: 297 + offset, y: 6, width: 26, height: 28)
     }
 
@@ -478,12 +514,36 @@ private final class CaptureHandleView: NSView {
     }
 
     @objc private func toggleRecording() {
+        guard !isBusy else { return }
         onToggleRecording?()
     }
 
     @objc private func hideFrame() {
-        guard !isRecording else { return }
+        guard !isRecording, !isBusy else { return }
         onHide?()
+    }
+
+    @objc private func cancelRecording() {
+        guard isRecording, !isBusy else { return }
+        onCancelRecording?()
+    }
+
+    @objc private func restartRecording() {
+        guard isRecording, !isBusy else { return }
+        onRestartRecording?()
+    }
+
+    private func configureTakeButton(_ button: OverlayButton, symbol: String, label: String,
+                                     help: String, action: Selector) {
+        button.bezelStyle = .rounded
+        button.isBordered = false
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        button.contentTintColor = .white.withAlphaComponent(0.85)
+        button.toolTip = help
+        button.setAccessibilityLabel(label)
+        button.target = self
+        button.action = action
+        addSubview(button)
     }
 
     private func configureMotionButton(_ button: OverlayButton, symbol: String?, label: String, action: Selector) {
@@ -503,6 +563,7 @@ private final class CaptureHandleView: NSView {
     }
 
     private func setMotionMode(_ mode: FrameMotionMode) {
+        guard !isBusy else { return }
         motionMode = mode
         updateMotionButtons()
         onMotionModeChanged?(mode)
@@ -517,6 +578,8 @@ private final class CaptureHandleView: NSView {
                 ? accent.withAlphaComponent(0.16).cgColor
                 : NSColor.clear.cgColor
             button.setAccessibilityValue(selected ? "Selected" : "Not selected")
+            button.isEnabled = !isBusy
+            button.alphaValue = isBusy ? 0.4 : 1
         }
     }
 
@@ -532,16 +595,24 @@ private final class CaptureHandleView: NSView {
     @objc private func panVertically() { setMotionMode(.vertical) }
 
     private func updateButtons() {
-        recordingButton.title = isRecording ? "Stop" : "Record"
+        recordingButton.title = isRecording ? "Finish" : "Record"
         recordingButton.image = NSImage(
             systemSymbolName: isRecording ? "stop.fill" : "record.circle.fill",
             accessibilityDescription: nil
         )
         recordingButton.contentTintColor = isRecording ? .systemRed : .white
-        recordingButton.toolTip = isRecording ? "Stop and save recording" : "Start recording"
-        recordingButton.setAccessibilityLabel(isRecording ? "Stop and save recording" : "Start recording")
-        hideButton.isEnabled = !isRecording
-        hideButton.alphaValue = isRecording ? 0.3 : 1
+        recordingButton.toolTip = isRecording ? "Finish and save the current take" : "Start recording"
+        recordingButton.setAccessibilityLabel(isRecording ? "Finish and save recording" : "Start recording")
+        recordingButton.isEnabled = !isBusy
+        recordingButton.alphaValue = isBusy ? 0.4 : 1
+        hideButton.isHidden = isRecording
+        hideButton.isEnabled = !isRecording && !isBusy
+        hideButton.alphaValue = isBusy ? 0.4 : 1
+        for button in [cancelButton, restartButton] {
+            button.isHidden = !isRecording
+            button.isEnabled = isRecording && !isBusy
+            button.alphaValue = isBusy ? 0.4 : 1
+        }
     }
 }
 
