@@ -7,8 +7,9 @@ Built for our own workflow at Code with Beto. This is an early version and will 
 ## Features
 
 - A movable 9:16 recording frame, with free, horizontal, and vertical movement.
-- Switch between one region, side-by-side, and stacked layouts while recording, with an adjustable divider.
+- Switch between one region and two stacked regions while recording, with an adjustable divider.
 - Add your camera to either region or use a movable, resizable overlay. Turn it off and back on during a take.
+- Zoom and reposition the camera image inside its frame to focus on your face.
 - Composition and caption guides that do not appear in the saved video.
 - A resizable live preview, microphone selection, input-channel controls, and a decibel meter.
 - Cancel, restart, or finish a take from the app or floating frame controls.
@@ -30,6 +31,8 @@ open vcam/vcam.xcodeproj
 4. **Finish** saves the video and opens it in **QuickTime Player**. **Cancel** discards the current take; **Restart** discards it and starts a fresh take with the same composition.
 
 To include your face, choose a camera device and enable access in **Setup**. In **Live**, choose **Floating overlay** or replace either split region. Drag the overlay or its resize handle in the preview. Layout and camera placement can change throughout a take; output resolution, orientation, frame rate, and devices are set beforehand. Both regions are saved in one video, with your separately selected microphone.
+
+Use the camera's **Zoom** slider for a closer crop. Choose **Adjust crop**, then drag inside the camera image to frame your face. **Done** returns to moving the overlay; **Reset** restores the original framing. These adjustments also work during recording.
 
 **⇧⌘R** starts or stops recording. **⇧⌘F** shows or hides the frame while idle.
 

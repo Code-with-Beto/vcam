@@ -76,7 +76,6 @@ struct ValidateModel {
             application.setActivationPolicy(.prohibited)
             defer { ModelValidation.defaults.removePersistentDomain(forName: ModelValidation.suite) }
             try validateNarrowSplit()
-            try await validateSideBySideClamping()
             try validateStackedClamping()
             try validateIndependentResize()
             try await validateLayoutTransitions()
@@ -85,9 +84,11 @@ struct ValidateModel {
             try await validateCameraDefaultsAndOverlay()
             try await validateCameraRegionTransitions()
             try await validateCameraOverlayPersistence()
+            try validateLegacyLayoutMigration()
+            try await validateCameraFraming()
             try ModelValidation.require(application.windows.allSatisfy { !$0.isVisible },
                                         "Validation unexpectedly displayed a window")
-            print("PASS: Model split roundtrips, display clamping, independent B sizing, layout/orientation aspects, secondary persistence metadata, and camera placement/geometry/persistence without starting inputs. Preferences used an isolated temporary suite.")
+            print("PASS: Model split roundtrips, display clamping, independent B sizing, layout/orientation aspects, secondary persistence metadata, camera placement/geometry/persistence, legacy layout migration, and camera crop/zoom isolation without starting inputs. Preferences used an isolated temporary suite.")
         } catch {
             fputs("FAIL: \(error.localizedDescription)\n", stderr)
             exit(1)
@@ -97,40 +98,20 @@ struct ValidateModel {
     @MainActor
     private static func validateNarrowSplit() throws {
         let model = try ModelValidation.makeModel()
-        model.setLayout(.sideBySide)
+        model.setLayout(.stacked)
         let first = model.captureFrame, second = model.secondaryCaptureFrame
         model.setSplitRatio(0.15)
-        try ModelValidation.equalSize(model.captureFrame.size, CGSize(width: 54, height: 640),
-                                      "A narrow split must not impose a 144-point minimum")
+        try ModelValidation.equalSize(model.captureFrame.size, CGSize(width: 360, height: 96),
+                                      "A narrow stacked split must allow a source shorter than 144 points")
         try ModelValidation.validRegions(model)
         model.setSplitRatio(0.85)
+        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, CGSize(width: 360, height: 96),
+                                      "B narrow stacked split must allow a source shorter than 144 points")
         model.setSplitRatio(0.5)
         try ModelValidation.equalSize(model.captureFrame.size, first.size, "Narrow A roundtrip")
         try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second.size, "Narrow B roundtrip")
         try ModelValidation.validRegions(model)
-        print("Narrow split: A 180×640 → 54×640 → 180×640; B restores its size.")
-    }
-
-    @MainActor
-    private static func validateSideBySideClamping() async throws {
-        let model = try ModelValidation.makeModel(width: 1000, height: 900)
-        await model.setOrientation(.landscape)
-        model.setLayout(.sideBySide)
-        model.setFrameHeight(800)
-        model.selectRegion(.secondary)
-        model.setFrameHeight(600)
-        model.selectRegion(.primary)
-        let first = model.captureFrame.size, second = model.secondaryCaptureFrame.size
-        model.setSplitRatio(0.85)
-        try ModelValidation.require(model.captureFrame.height < first.height - 1,
-                                    "Side-by-side fixture did not exercise display clamping")
-        for ratio in [0.15, 0.5, 0.85, 0.15, 0.5] {
-            model.setSplitRatio(ratio)
-            try ModelValidation.validRegions(model)
-        }
-        try ModelValidation.equalSize(model.captureFrame.size, first, "Display-clamped side-by-side A roundtrip")
-        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second, "Display-clamped side-by-side B roundtrip")
-        print("Side-by-side clamp: repeated 15–85% changes restore A's 800pt and B's 600pt heights.")
+        print("Narrow stacked split: A 360×320 → 360×96 → 360×320; B restores its size.")
     }
 
     @MainActor
@@ -155,21 +136,19 @@ struct ValidateModel {
 
     @MainActor
     private static func validateIndependentResize() throws {
-        for layout in [CaptureLayout.sideBySide, .stacked] {
-            let model = try ModelValidation.makeModel()
-            model.setLayout(layout)
-            let first = model.captureFrame
-            model.selectRegion(.secondary)
-            model.setFrameHeight(400)
-            try ModelValidation.require(model.captureFrame == first, "Resizing B changed A in \(layout.title)")
-            try ModelValidation.require(abs(model.secondaryCaptureFrame.height - 400) < 0.001,
-                                        "The height entry did not resize selected B")
-            let resized = model.secondaryCaptureFrame.size
-            model.setSplitRatio(0.15)
-            model.setSplitRatio(0.5)
-            try ModelValidation.equalSize(model.secondaryCaptureFrame.size, resized, "Explicit B scale after divider roundtrip")
-            try ModelValidation.validRegions(model)
-        }
+        let model = try ModelValidation.makeModel()
+        model.setLayout(.stacked)
+        let first = model.captureFrame
+        model.selectRegion(.secondary)
+        model.setFrameHeight(400)
+        try ModelValidation.require(model.captureFrame == first, "Resizing B changed A in Stacked")
+        try ModelValidation.require(abs(model.secondaryCaptureFrame.height - 400) < 0.001,
+                                    "The height entry did not resize selected B")
+        let resized = model.secondaryCaptureFrame.size
+        model.setSplitRatio(0.15)
+        model.setSplitRatio(0.5)
+        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, resized, "Explicit B scale after divider roundtrip")
+        try ModelValidation.validRegions(model)
         print("Region selection: explicit B sizing leaves A unchanged and establishes B's new split scale.")
     }
 
@@ -179,7 +158,7 @@ struct ValidateModel {
             let model = try ModelValidation.makeModel(resolution: resolution)
             for orientation in [CaptureOrientation.portrait, .landscape, .portrait] {
                 await model.setOrientation(orientation)
-                for layout in [CaptureLayout.single, .sideBySide, .stacked, .single] {
+                for layout in [CaptureLayout.single, .stacked, .single] {
                     model.setLayout(layout)
                     if model.hasTwoRegions {
                         model.selectRegion(.secondary)
@@ -231,21 +210,16 @@ struct ValidateModel {
         model.selectRegion(.secondary)
         model.setFrameWidth(540)
         let first = model.captureFrame.size, second = model.secondaryCaptureFrame.size
-        model.setLayout(.sideBySide)
-        try ModelValidation.equalSize(model.captureFrame.size, CGSize(width: 360, height: 1280), "A scale through stacked → side by side")
-        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, CGSize(width: 270, height: 960), "B scale through stacked → side by side")
-        model.setLayout(.stacked)
-        try ModelValidation.equalSize(model.captureFrame.size, first, "A layout roundtrip")
-        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second, "B layout roundtrip")
-        model.setLayout(.sideBySide)
         model.setLayout(.single)
         try ModelValidation.equalSize(model.captureFrame.size, CGSize(width: 720, height: 1280), "A scale entering single mode")
-        model.setLayout(.sideBySide)
-        try ModelValidation.equalSize(model.captureFrame.size, CGSize(width: 360, height: 1280), "A side-by-side scale after single mode")
-        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, CGSize(width: 270, height: 960), "B side-by-side scale after single mode")
+        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second, "Single mode retains the hidden B frame")
         model.setLayout(.stacked)
         try ModelValidation.equalSize(model.captureFrame.size, first, "A scale after returning from single mode")
         try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second, "B scale after returning from single mode")
+        model.setLayout(.single)
+        model.setLayout(.stacked)
+        try ModelValidation.equalSize(model.captureFrame.size, first, "A repeated layout roundtrip")
+        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second, "B repeated layout roundtrip")
         await model.setOrientation(.landscape)
         try ModelValidation.equalSize(model.captureFrame.size, CGSize(width: 1280, height: 360), "A scale entering landscape")
         try ModelValidation.equalSize(model.secondaryCaptureFrame.size, CGSize(width: 960, height: 270), "B scale entering landscape")
@@ -298,46 +272,44 @@ struct ValidateModel {
             let model = try ModelValidation.makeModel()
             await model.setOrientation(orientation)
             await model.setCameraDevice("synthetic-model-camera")
-            for layout in [CaptureLayout.stacked, .sideBySide] {
-                model.setLayout(layout)
-                let first = model.captureFrame, second = model.secondaryCaptureFrame
-                for placement in [CameraPlacement.overlay, .regionA, .regionB, .off] {
-                    await model.setCameraPlacement(placement)
-                    try ModelValidation.require(model.cameraPlacement == placement,
-                                                "Split layout changed requested camera placement")
-                    try ModelValidation.require(model.isCameraRegion(.primary) == (placement == .regionA)
-                                                && model.isCameraRegion(.secondary) == (placement == .regionB),
-                                                "Camera replacement identified the wrong screen region")
-                    if placement == .regionA || placement == .regionB {
-                        model.selectRegion(placement == .regionA ? .primary : .secondary)
-                        try ModelValidation.require(model.activeRegionIsCamera,
-                                                    "Selected camera region was exposed as a screen region")
-                        let before = model.activeCaptureFrame
-                        model.setFrameWidth(before.width * 0.75)
-                        model.setFrameHeight(before.height * 0.75)
-                        try ModelValidation.require(model.activeCaptureFrame == before,
-                                                    "Screen-size setters resized a camera-backed region")
-                    }
-                    try ModelValidation.require(model.captureFrame == first && model.secondaryCaptureFrame == second,
-                                                "Camera placement discarded or altered the saved screen rectangles")
-                    try ModelValidation.validRegions(model)
+            model.setLayout(.stacked)
+            let first = model.captureFrame, second = model.secondaryCaptureFrame
+            for placement in [CameraPlacement.overlay, .regionA, .regionB, .off] {
+                await model.setCameraPlacement(placement)
+                try ModelValidation.require(model.cameraPlacement == placement,
+                                            "Split layout changed requested camera placement")
+                try ModelValidation.require(model.isCameraRegion(.primary) == (placement == .regionA)
+                                            && model.isCameraRegion(.secondary) == (placement == .regionB),
+                                            "Camera replacement identified the wrong screen region")
+                if placement == .regionA || placement == .regionB {
+                    model.selectRegion(placement == .regionA ? .primary : .secondary)
+                    try ModelValidation.require(model.activeRegionIsCamera,
+                                                "Selected camera region was exposed as a screen region")
+                    let before = model.activeCaptureFrame
+                    model.setFrameWidth(before.width * 0.75)
+                    model.setFrameHeight(before.height * 0.75)
+                    try ModelValidation.require(model.activeCaptureFrame == before,
+                                                "Screen-size setters resized a camera-backed region")
                 }
-                try ModelValidation.require(!model.activeRegionIsCamera,
-                                            "Turning camera Off did not restore the selected screen region")
-                await model.setCameraPlacement(.regionB)
-                model.setLayout(.single)
-                try ModelValidation.require(model.cameraPlacement == .overlay && !model.hasTwoRegions
-                                            && model.selectedRegion == .primary && !model.activeRegionIsCamera,
-                                            "Single layout did not safely convert the camera region into a floating overlay")
+                try ModelValidation.require(model.captureFrame == first && model.secondaryCaptureFrame == second,
+                                            "Camera placement discarded or altered the saved screen rectangles")
                 try ModelValidation.validRegions(model)
-                for placement in [CameraPlacement.regionA, .regionB] {
-                    await model.setCameraPlacement(placement)
-                    try ModelValidation.require(model.cameraPlacement == .overlay,
-                                                "Single layout accepted an unavailable camera replacement region")
-                    try ModelValidation.validRegions(model)
-                }
-                await model.setCameraPlacement(.off)
             }
+            try ModelValidation.require(!model.activeRegionIsCamera,
+                                        "Turning camera Off did not restore the selected screen region")
+            await model.setCameraPlacement(.regionB)
+            model.setLayout(.single)
+            try ModelValidation.require(model.cameraPlacement == .overlay && !model.hasTwoRegions
+                                        && model.selectedRegion == .primary && !model.activeRegionIsCamera,
+                                        "Single layout did not safely convert the camera region into a floating overlay")
+            try ModelValidation.validRegions(model)
+            for placement in [CameraPlacement.regionA, .regionB] {
+                await model.setCameraPlacement(placement)
+                try ModelValidation.require(model.cameraPlacement == .overlay,
+                                            "Single layout accepted an unavailable camera replacement region")
+                try ModelValidation.validRegions(model)
+            }
+            await model.setCameraPlacement(.off)
         }
         print("Camera regions: A/B replacement preserves hidden screen rectangles, rejects screen resizing, restores them when Off, and converts to an overlay in Single mode across both orientations.")
     }
@@ -374,6 +346,135 @@ struct ValidateModel {
                                     "Restoring camera settings opened an input, window, or permission request")
         try ModelValidation.validRegions(model)
         print("Camera overlay persistence: shape, device, mirroring, position, and size survive recreation; invalid coordinates and sizes remain within portrait/landscape output bounds.")
+    }
+
+    @MainActor
+    private static func validateLegacyLayoutMigration() throws {
+        let defaults = ModelValidation.defaults
+        defaults.removePersistentDomain(forName: ModelValidation.suite)
+        defaults.set("sideBySide", forKey: "captureLayout")
+        defaults.set(0.35, forKey: "splitRatio")
+        defaults.set("synthetic-legacy-camera", forKey: "cameraID")
+        defaults.set(CameraPlacement.regionB.rawValue, forKey: "cameraPlacement")
+        defaults.set("synthetic-legacy-microphone", forKey: "microphoneID")
+        defaults.set(223.5, forKey: "frameWidth")
+        defaults.set(706.0, forKey: "secondaryFrameWidth")
+        defaults.set(564.8, forKey: "secondaryFrameHeight")
+        defaults.set(-310.0, forKey: "secondaryFrameX")
+        defaults.set(240.0, forKey: "secondaryFrameY")
+        defaults.set(0xC0A1, forKey: "secondaryFrameDisplayID")
+        let savedKeys = ["frameWidth", "secondaryFrameWidth", "secondaryFrameHeight",
+                         "secondaryFrameX", "secondaryFrameY", "secondaryFrameDisplayID"]
+        let savedGeometry = savedKeys.map { defaults.double(forKey: $0) }
+        let model = RecorderModel()
+        try ModelValidation.require(CaptureLayout.allCases == [.single, .stacked],
+                                    "The retired layout is still exposed as an available option")
+        try ModelValidation.require(model.layout == .stacked && model.hasTwoRegions
+                                    && model.cameraPlacement == .regionB && model.splitRatio == 0.35,
+                                    "Legacy layout migration lost the stacked split or camera's B region")
+        try ModelValidation.require(defaults.string(forKey: "captureLayout") == CaptureLayout.stacked.rawValue,
+                                    "Legacy layout was not migrated durably in preferences")
+        try ModelValidation.require(savedKeys.map { defaults.double(forKey: $0) } == savedGeometry,
+                                    "Layout migration discarded saved source geometry before a display can restore it")
+        try ModelValidation.require(model.selectedCameraID == "synthetic-legacy-camera"
+                                    && model.selectedMicrophoneID == "synthetic-legacy-microphone",
+                                    "Layout migration changed selected input devices")
+        let restored = RecorderModel()
+        try ModelValidation.require(restored.layout == .stacked && restored.cameraPlacement == .regionB,
+                                    "Migrated layout or camera placement did not survive recreation")
+        try ModelValidation.require(!model.isPreviewing && !model.isRecording && !model.isFrameVisible
+                                    && !model.requestingCamera && model.cameras.isEmpty,
+                                    "Migration opened an input, window, or permission request")
+        print("Legacy layout: old saved two-column takes reopen as Stacked, preserve the camera panel and source geometry, and save the supported layout.")
+    }
+
+    @MainActor
+    private static func validateCameraFraming() async throws {
+        let model = try ModelValidation.makeModel()
+        try ModelValidation.require(model.cameraFraming == CameraFramingConfiguration()
+                                    && model.cameraConfiguration.framing == model.cameraFraming,
+                                    "A fresh camera must start with its default, centered framing")
+        try ModelValidation.equalSize(model.cameraSourceSize, CGSize(width: 1920, height: 1080),
+                                      "Camera framing's source-size fallback")
+        model.setLayout(.stacked)
+        model.selectedMicrophoneID = "synthetic-crop-microphone"
+        model.microphoneChannel = 1
+        await model.setCameraDevice("synthetic-crop-camera")
+        model.setCameraOverlay(CameraOverlayConfiguration(center: CGPoint(x: 0.32, y: 0.68),
+                                                           widthFraction: 0.42, shape: .roundedRectangle))
+        let first = model.captureFrame, second = model.secondaryCaptureFrame
+        let output = model.outputSize, overlay = model.cameraOverlay
+        let overlayRect = overlay.rect(in: output)
+        let fps = model.framesPerSecond
+        let framing = CameraFramingConfiguration(zoom: 2.4, center: CGPoint(x: 0.61, y: 0.42))
+        for placement in [CameraPlacement.overlay, .regionA, .regionB, .off] {
+            await model.setCameraPlacement(placement)
+            model.setCameraFraming(framing)
+            try ModelValidation.require(model.cameraFraming == framing
+                                        && model.cameraConfiguration.framing == framing,
+                                        "Camera framing did not propagate in \(placement.title) mode")
+            try ModelValidation.require(model.captureFrame == first && model.secondaryCaptureFrame == second
+                                        && model.cameraOverlay == overlay
+                                        && model.cameraOverlay.rect(in: output) == overlayRect,
+                                        "Cropping camera content moved or resized a screen source or overlay frame")
+            try ModelValidation.require(model.outputSize == output && model.layout == .stacked
+                                        && model.framesPerSecond == fps
+                                        && model.selectedMicrophoneID == "synthetic-crop-microphone"
+                                        && model.microphoneChannel == 1,
+                                        "Camera framing changed the output, layout, frame rate, or microphone")
+            try ModelValidation.validRegions(model)
+        }
+        let unmirrored = CameraFramingConfiguration(zoom: 2, center: CGPoint(x: 0.25, y: 0.6))
+        model.setCameraFraming(unmirrored)
+        model.setMirrorsCamera(false)
+        let mirroredCenter = CameraFramingConfiguration(zoom: 2, center: CGPoint(x: 0.75, y: 0.6))
+        try ModelValidation.require(model.cameraFraming == mirroredCenter,
+                                    "Changing mirroring did not reflect the crop center to preserve the same subject")
+        model.setMirrorsCamera(false)
+        try ModelValidation.require(model.cameraFraming == mirroredCenter,
+                                    "Reapplying the same mirror setting moved the crop center again")
+        model.setMirrorsCamera(true)
+        try ModelValidation.require(model.cameraFraming == unmirrored,
+                                    "Mirror roundtrip did not restore the original focal point")
+        model.setCameraFraming(framing)
+        let restored = RecorderModel()
+        try ModelValidation.require(restored.cameraFraming == framing
+                                    && restored.cameraConfiguration.framing == framing,
+                                    "Camera zoom and crop center did not survive model recreation")
+        let defaults = ModelValidation.defaults
+        try ModelValidation.require(defaults.double(forKey: "cameraZoom") == framing.zoom
+                                    && defaults.double(forKey: "cameraCropCenterX") == framing.center.x
+                                    && defaults.double(forKey: "cameraCropCenterY") == framing.center.y,
+                                    "Camera framing preferences do not describe the requested crop")
+        model.setCameraFraming(CameraFramingConfiguration(zoom: 20, center: CGPoint(x: -5, y: 6)))
+        try ModelValidation.require(model.cameraFraming.zoom == 4 && model.cameraFraming.center == CGPoint(x: 0, y: 1),
+                                    "Camera zoom or center exceeded supported bounds")
+        model.setCameraFraming(CameraFramingConfiguration(zoom: -2, center: CGPoint(x: 0.3, y: 0.6)))
+        try ModelValidation.require(model.cameraFraming.zoom == 1 && model.cameraFraming.center == CGPoint(x: 0.3, y: 0.6),
+                                    "Negative zoom was not clamped independently of a valid crop center")
+        model.setCameraFraming(CameraFramingConfiguration(zoom: .nan, center: CGPoint(x: CGFloat.infinity, y: CGFloat.nan)))
+        try ModelValidation.require(model.cameraFraming == CameraFramingConfiguration(),
+                                    "Nonfinite camera framing did not reset to safe defaults")
+        model.setCameraFraming(framing)
+        model.setCameraFraming(CameraFramingConfiguration())
+        let reset = RecorderModel()
+        try ModelValidation.require(reset.cameraFraming == CameraFramingConfiguration()
+                                    && reset.cameraConfiguration.framing == reset.cameraFraming,
+                                    "Reset framing did not durably restore the default zoom and center")
+        defaults.set(100.0, forKey: "cameraZoom")
+        defaults.set(-100.0, forKey: "cameraCropCenterX")
+        defaults.set(100.0, forKey: "cameraCropCenterY")
+        let clamped = RecorderModel()
+        try ModelValidation.require(clamped.cameraFraming.zoom == 4
+                                    && clamped.cameraFraming.center == CGPoint(x: 0, y: 1),
+                                    "Restoring invalid camera preferences did not clamp the crop")
+        for instance in [model, restored, reset, clamped] {
+            try ModelValidation.require(!instance.isPreviewing && !instance.isRecording && !instance.isFrameVisible
+                                        && !instance.requestingCamera && instance.cameras.isEmpty,
+                                        "Camera framing settings unexpectedly opened an input or visible window")
+        }
+        try ModelValidation.validRegions(model)
+        print("Camera framing: zoom and pan work in all placements, persist and reset, clamp invalid settings, and leave source/overlay geometry, output, and microphone unchanged.")
     }
 
     @MainActor

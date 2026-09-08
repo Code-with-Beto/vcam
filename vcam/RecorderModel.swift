@@ -37,6 +37,9 @@ final class RecorderModel {
     private(set) var selectedCameraID: String = ""
     private(set) var cameraPlacement: CameraPlacement = .off
     private(set) var cameraOverlay = CameraOverlayConfiguration()
+    private(set) var cameraFraming = CameraFramingConfiguration()
+    private(set) var cameraSourceSize = CGSize(width: 1920, height: 1080)
+    var isAdjustingCameraCrop = false
     private(set) var mirrorsCamera = true
     private(set) var cameraAuthorization = AVAuthorizationStatus.notDetermined
     private(set) var requestingCamera = false
@@ -66,7 +69,7 @@ final class RecorderModel {
         didSet {
             UserDefaults.standard.set(resolution.rawValue, forKey: "resolution")
             if hasPrepared {
-                refitFrames(preserveHeight: layout == .sideBySide)
+                refitFrames()
                 saveFramePosition()
                 refreshOverlay()
             }
@@ -87,7 +90,9 @@ final class RecorderModel {
     private(set) var splitRatio: Double = 0.5
     private(set) var selectedRegion: CaptureRegion = .primary
     private(set) var isFrameVisible = false
-    private(set) var isPreviewing = false
+    private(set) var isPreviewing = false {
+        didSet { if !isPreviewing { isAdjustingCameraCrop = false } }
+    }
     private(set) var isRecording = false
     private(set) var isBusy = false {
         didSet {
@@ -143,7 +148,11 @@ final class RecorderModel {
         showsGuides = defaults.object(forKey: "showsGuides") as? Bool ?? true
         frameWidth = defaults.object(forKey: "frameWidth") as? Double ?? 360
         orientation = CaptureOrientation(rawValue: defaults.string(forKey: "orientation") ?? "") ?? .portrait
-        layout = CaptureLayout(rawValue: defaults.string(forKey: "captureLayout") ?? "") ?? .single
+        let savedLayout = defaults.string(forKey: "captureLayout") ?? ""
+        // Preserve two sources when opening a setup saved before the horizontal
+        // layout was removed. Subsequent launches use the supported stacked layout.
+        layout = savedLayout == "sideBySide" ? .stacked : CaptureLayout(rawValue: savedLayout) ?? .single
+        if savedLayout == "sideBySide" { defaults.set(layout.rawValue, forKey: "captureLayout") }
         let savedSplit = defaults.object(forKey: "splitRatio") as? Double ?? 0.5
         splitRatio = savedSplit.isFinite ? min(max(savedSplit, 0.15), 0.85) : 0.5
         resolution = OutputResolution(rawValue: defaults.integer(forKey: "resolution")) ?? .qhd
@@ -159,7 +168,15 @@ final class RecorderModel {
             widthFraction: defaults.object(forKey: "cameraWidthFraction") as? Double ?? 0.30,
             shape: CameraShape(rawValue: defaults.string(forKey: "cameraShape") ?? "") ?? .circle)
         cameraOverlay = cameraOverlay.clamped(in: outputSize)
+        cameraFraming = CameraFramingConfiguration(
+            zoom: defaults.object(forKey: "cameraZoom") as? Double ?? 1,
+            center: CGPoint(x: defaults.object(forKey: "cameraCropCenterX") as? Double ?? 0.5,
+                            y: defaults.object(forKey: "cameraCropCenterY") as? Double ?? 0.5)).clamped()
         restoreOutputFolder()
+        engine.onCameraSourceSize = { [weak self] size in
+            guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
+            self?.cameraSourceSize = size
+        }
         engine.onPreviewPixelBuffer = { [weak self] buffer in self?.previewSurface.display(buffer) }
         engine.onAudioDecibels = { [weak self] level in self?.audioDecibels = level }
         engine.onAudioChannel = { [weak self] channel in self?.activeMicrophoneChannel = channel }
@@ -171,6 +188,7 @@ final class RecorderModel {
         engine.onCameraFailure = { [weak self] message in
             guard let self else { return }
             self.cameraPlacement = .off
+            self.isAdjustingCameraCrop = false
             self.saveCameraSettings()
             if self.isFrameVisible { self.showFrame() }
             self.notice = message + (self.isRecording ? " Screen and microphone recording continue." : " Choose a camera to try again.")
@@ -214,7 +232,7 @@ final class RecorderModel {
     }
     var cameraConfiguration: CameraConfiguration {
         CameraConfiguration(deviceID: selectedCameraID.isEmpty ? nil : selectedCameraID,
-            placement: cameraPlacement, overlay: cameraOverlay, mirrored: mirrorsCamera)
+            placement: cameraPlacement, overlay: cameraOverlay, mirrored: mirrorsCamera, framing: cameraFraming)
     }
     var activeRegionIsCamera: Bool { isCameraRegion(selectedRegion) }
     func isCameraRegion(_ region: CaptureRegion) -> Bool {
@@ -364,11 +382,12 @@ final class RecorderModel {
         defer { isBusy = false }
         if isPreviewing {
             let requested = CameraConfiguration(deviceID: deviceID.isEmpty ? nil : deviceID,
-                placement: placement, overlay: cameraOverlay, mirrored: mirrorsCamera)
+                placement: placement, overlay: cameraOverlay, mirrored: mirrorsCamera, framing: cameraFraming)
             do {
                 try await engine.setCamera(requested)
             } catch {
                 cameraPlacement = .off
+                isAdjustingCameraCrop = false
                 saveCameraSettings()
                 if isFrameVisible { showFrame() }
                 notice = error.localizedDescription + (isRecording ? " Your screen recording is still running." : "")
@@ -376,6 +395,7 @@ final class RecorderModel {
             }
         }
         cameraPlacement = placement
+        if placement == .off { isAdjustingCameraCrop = false }
         selectedCameraID = deviceID
         saveCameraSettings()
         if isFrameVisible { showFrame() }
@@ -389,8 +409,18 @@ final class RecorderModel {
     }
 
     func setMirrorsCamera(_ value: Bool) {
-        guard !isBusy && !isShuttingDown else { return }
+        guard !isBusy && !isShuttingDown, value != mirrorsCamera else { return }
         mirrorsCamera = value
+        // Center is measured in the displayed, mirrored source. Reflect it too
+        // so flipping the image keeps the same subject inside a zoomed crop.
+        cameraFraming.center.x = 1 - cameraFraming.center.x
+        saveCameraSettings()
+        engine.updateCamera(cameraConfiguration)
+    }
+
+    func setCameraFraming(_ value: CameraFramingConfiguration) {
+        guard !isBusy && !isShuttingDown else { return }
+        cameraFraming = value.clamped()
         saveCameraSettings()
         engine.updateCamera(cameraConfiguration)
     }
@@ -404,6 +434,9 @@ final class RecorderModel {
         defaults.set(cameraOverlay.center.y, forKey: "cameraCenterY")
         defaults.set(cameraOverlay.widthFraction, forKey: "cameraWidthFraction")
         defaults.set(cameraOverlay.shape.rawValue, forKey: "cameraShape")
+        defaults.set(cameraFraming.zoom, forKey: "cameraZoom")
+        defaults.set(cameraFraming.center.x, forKey: "cameraCropCenterX")
+        defaults.set(cameraFraming.center.y, forKey: "cameraCropCenterY")
     }
 
     func setFrameWidth(_ width: Double) {
@@ -416,8 +449,7 @@ final class RecorderModel {
 
     func regionTitle(_ region: CaptureRegion) -> String {
         if layout == .single { return "Frame" }
-        if layout == .stacked { return region == .primary ? "A · Top" : "B · Bottom" }
-        return region == .primary ? "A · Left" : "B · Right"
+        return region == .primary ? "A · Top" : "B · Bottom"
     }
 
     func selectRegion(_ region: CaptureRegion) {
@@ -450,7 +482,7 @@ final class RecorderModel {
         guard abs(value - splitRatio) > 0.0001 else { return }
         commitFrameEdits?()
         splitRatio = value
-        refitFrames(preserveHeight: layout == .sideBySide, preserveSplitScale: true)
+        refitFrames(preserveSplitScale: true)
         saveFramePosition()
         updateComposition()
         refreshOverlay()
@@ -473,43 +505,41 @@ final class RecorderModel {
         if hasTwoRegions {
             secondaryCaptureFrame = remap(secondaryCaptureFrame, region: .secondary, previous: previousCells[1])
         }
-        refitFrames(preserveHeight: false)
+        refitFrames()
     }
 
-    private func fittedFrame(_ frame: CGRect, for region: CaptureRegion, preserveHeight: Bool,
+    private func fittedFrame(_ frame: CGRect, for region: CaptureRegion,
                              requestedExtent: CGFloat? = nil) -> CGRect {
         guard let display = selectedDisplay else { return frame }
         let cell = destinationRect(for: region)
         let aspect = cell.width / max(cell.height, 1)
-        let extent = requestedExtent ?? (preserveHeight ? frame.height : frame.width)
-        let width = preserveHeight ? extent * aspect : extent
+        let width = requestedExtent ?? frame.width
         return CaptureGeometry.frame(width: width,
             centeredAt: CGPoint(x: frame.midX, y: frame.midY),
             within: frameBounds(for: display), aspectRatio: aspect, minimumWidth: 1)
     }
 
-    private func refitFrames(preserveHeight: Bool, preserveSplitScale: Bool = false) {
+    private func refitFrames(preserveSplitScale: Bool = false) {
         guard let display = selectedDisplay else { return }
-        captureFrame = fittedFrame(captureFrame, for: .primary, preserveHeight: preserveHeight,
+        captureFrame = fittedFrame(captureFrame, for: .primary,
             requestedExtent: preserveSplitScale && primarySplitExtent > 0 ? primarySplitExtent : nil)
         if hasTwoRegions {
             if secondaryCaptureFrame.isEmpty {
                 let bounds = frameBounds(for: display)
                 let cell = destinationRect(for: .secondary)
                 let aspect = cell.width / max(cell.height, 1)
-                let width = layout == .sideBySide ? captureFrame.height * aspect : captureFrame.width
-                secondaryCaptureFrame = CaptureGeometry.frame(width: width,
+                secondaryCaptureFrame = CaptureGeometry.frame(width: captureFrame.width,
                     centeredAt: CGPoint(x: bounds.minX + bounds.width * 0.25, y: bounds.midY),
                     within: bounds, aspectRatio: aspect, minimumWidth: 1)
             } else {
-                secondaryCaptureFrame = fittedFrame(secondaryCaptureFrame, for: .secondary, preserveHeight: preserveHeight,
+                secondaryCaptureFrame = fittedFrame(secondaryCaptureFrame, for: .secondary,
                     requestedExtent: preserveSplitScale && secondarySplitExtent > 0 ? secondarySplitExtent : nil)
             }
             secondaryOutputCell = destinationRect(for: .secondary)
         }
         if !preserveSplitScale {
-            primarySplitExtent = layout == .sideBySide ? captureFrame.height : captureFrame.width
-            secondarySplitExtent = layout == .sideBySide ? secondaryCaptureFrame.height : secondaryCaptureFrame.width
+            primarySplitExtent = captureFrame.width
+            secondarySplitExtent = secondaryCaptureFrame.width
         }
         frameWidth = activeCaptureFrame.width
     }
@@ -588,7 +618,7 @@ final class RecorderModel {
             aspectRatio: cell.width / max(cell.height, 1))
         secondaryCaptureFrame = .zero
         secondaryOutputCell = nil
-        refitFrames(preserveHeight: false)
+        refitFrames()
         saveFramePosition()
         refreshOverlay()
     }
@@ -602,10 +632,10 @@ final class RecorderModel {
             within: frameBounds(for: display), aspectRatio: activeAspectRatio, minimumWidth: minimumFrameWidth)
         if selectedRegion == .primary {
             captureFrame = resized
-            primarySplitExtent = layout == .sideBySide ? resized.height : resized.width
+            primarySplitExtent = resized.width
         } else {
             secondaryCaptureFrame = resized
-            secondarySplitExtent = layout == .sideBySide ? resized.height : resized.width
+            secondarySplitExtent = resized.width
         }
         frameWidth = activeCaptureFrame.width
         saveFramePosition()
@@ -926,7 +956,7 @@ final class RecorderModel {
                 secondaryOutputCell = CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
             }
         }
-        refitFrames(preserveHeight: false)
+        refitFrames()
     }
 
     private func saveFramePosition() {

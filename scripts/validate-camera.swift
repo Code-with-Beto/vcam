@@ -35,12 +35,7 @@ struct ValidateCamera {
         states.append((.single, configuration))
         configuration.overlay.shape = .roundedRectangle
         states.append((.single, configuration))
-        states.append((.sideBySide, configuration))
         states.append((.stacked, configuration))
-        configuration.placement = .regionA
-        states.append((.sideBySide, configuration))
-        configuration.placement = .regionB
-        states.append((.sideBySide, configuration))
         configuration.placement = .regionA
         states.append((.stacked, configuration))
         configuration.placement = .regionB
@@ -50,11 +45,31 @@ struct ValidateCamera {
         configuration.placement = .regionA
         states.append((.stacked, configuration))
         configuration.placement = .off
-        states.append((.sideBySide, configuration))
+        states.append((.stacked, configuration))
         configuration.placement = .overlay
         states.append((.single, configuration))
         configuration.placement = .off
         states.append((.single, configuration))
+        // All framing changes occur during this same take. The asymmetric crop
+        // positions expose zoom, pan direction, mirror order, and edge clamping.
+        configuration.placement = .overlay
+        configuration.framing = CameraFramingConfiguration(zoom: 1.8, center: CGPoint(x: 0.65, y: 0.4))
+        states.append((.single, configuration))
+        configuration.mirrored = false
+        states.append((.single, configuration))
+        configuration.overlay.shape = .circle
+        configuration.framing = CameraFramingConfiguration(zoom: 4, center: CGPoint(x: 0, y: 1))
+        states.append((.single, configuration))
+        configuration.placement = .regionA
+        configuration.framing = CameraFramingConfiguration(zoom: 3, center: CGPoint(x: 1, y: 0))
+        states.append((.stacked, configuration))
+        configuration.placement = .regionB
+        configuration.framing = CameraFramingConfiguration(zoom: 2, center: CGPoint(x: 0.1, y: 0.8))
+        states.append((.stacked, configuration))
+        configuration.mirrored = true
+        states.append((.stacked, configuration))
+        configuration.framing = CameraFramingConfiguration()
+        states.append((.stacked, configuration))
         let compositions = states.map { CaptureComposition(layout: $0.0, primaryFrame: primary, secondaryFrame: secondary) }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("vcam-camera-validation-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -89,20 +104,26 @@ struct ValidateCamera {
                     for left in [false, true] {
                         let point = CGPoint(x: rect.minX + rect.width * (left ? 0.30 : 0.70),
                             y: rect.minY + rect.height * (top ? 0.70 : 0.30))
-                        let sourceLeft = state.1.mirrored ? !left : left
-                        let patch = (top ? 0 : 2) + (sourceLeft ? 0 : 1)
-                        let gray = reference[cameraLuma[patch]]!
-                        try expect(image.pixel(point), [gray, gray, gray], "Phase \(index) camera orientation/color")
+                        try expect(image.pixel(point), cameraColor(at: point, in: rect, configuration: state.1, reference: reference),
+                                   "Phase \(index) camera framing/orientation/color")
                     }
                 }
                 if state.1.placement == .overlay {
                     let corner = CGPoint(x: rect.minX + 2, y: rect.minY + 2)
                     try expect(image.pixel(corner), screenColor(at: corner, cells: cells), "Phase \(index) masked corner must show screen")
                     let topEdge = CGPoint(x: rect.midX, y: rect.maxY - 6)
-                    let gray = reference[cameraLuma[state.1.mirrored ? 0 : 1]]!
                     // Avoid the camera's exact quadrant seam for this edge assertion.
                     let edgePoint = CGPoint(x: topEdge.x + rect.width * 0.03, y: rect.maxY - rect.height * 0.08)
-                    try expect(image.pixel(edgePoint), [gray, gray, gray], "Phase \(index) mask must include the face area")
+                    try expect(image.pixel(edgePoint), cameraColor(at: edgePoint, in: rect, configuration: state.1, reference: reference),
+                               "Phase \(index) mask must include the face area")
+                } else {
+                    // Samples just inside all four region corners must stay
+                    // covered, including when a zoomed crop reaches source edges.
+                    for x in [0.01, 0.99] { for y in [0.01, 0.99] {
+                        let point = CGPoint(x: rect.minX + rect.width * x, y: rect.minY + rect.height * y)
+                        try expect(image.pixel(point), cameraColor(at: point, in: rect, configuration: state.1, reference: reference),
+                                   "Phase \(index) cropped region must never expose black edges")
+                    } }
                 }
             }
             for (cellIndex, cell) in cells.enumerated() {
@@ -125,7 +146,7 @@ struct ValidateCamera {
         try check(images[2].pixel(expansionPoint).max()! - images[2].pixel(expansionPoint).min()! < 8,
                   "Resizing overlay must cover the newly included screen pixels with the grayscale camera")
         try await validateAudioAndTiming(asset, video: video[0], audio: audio[0])
-        print("PASS: 1440×2560 camera circle/rounded mask, move/resize, one mirror, Rec.709 NV12 color conversion, live Off/On, single/dual layouts and A/B replacement on one monotonic writer timeline, released camera providers, and independent mono AAC.")
+        print("PASS: 1440×2560 camera circle/rounded mask, move/resize, live zoom/pan/reset, post-mirror crop direction, no exposed crop edges, Rec.709 NV12 color conversion, live Off/On, single/stacked layouts and A/B replacement on one monotonic writer timeline, released camera providers, and independent mono AAC.")
         print("Synthetic camera recording: \(result.url.path)")
     }
 
@@ -195,6 +216,18 @@ struct ValidateCamera {
 
     static func screenColor(at point: CGPoint, cells: [CGRect]) -> [Int] {
         screenColors[cells.firstIndex(where: { $0.contains(point) }) ?? 0]
+    }
+
+    static func cameraColor(at point: CGPoint, in destination: CGRect, configuration: CameraConfiguration,
+                            reference: [Int: Int]) -> [Int] {
+        let source = CGSize(width: 640, height: 480)
+        let crop = configuration.framing.sourceRect(in: source, filling: destination.size)
+        var x = crop.minX + (point.x - destination.minX) / destination.width * crop.width
+        let y = crop.minY + (point.y - destination.minY) / destination.height * crop.height
+        if configuration.mirrored { x = source.width - x }
+        let patch = (y >= source.height / 2 ? 0 : 2) + (x < source.width / 2 ? 0 : 1)
+        let gray = reference[cameraLuma[patch]]!
+        return [gray, gray, gray]
     }
 
     static func validateAudioAndTiming(_ asset: AVAsset, video: AVAssetTrack, audio: AVAssetTrack) async throws {

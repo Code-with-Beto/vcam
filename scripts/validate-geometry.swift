@@ -24,7 +24,50 @@ struct ValidateGeometry {
         precondition(moved.size == requested.size, "Moving a frame must never resize it")
         validateSourcePixelCrop()
         validatePixelAlignedContrast()
-        print("PASS: vertical geometry, negative display origins, screen-edge restoration, resize limits, clamped movement, Retina source-pixel mapping, integral crop origins, preserved crop dimensions/aspect, and 1:1 edge contrast.")
+        validateCameraFraming()
+        print("PASS: vertical geometry, negative display origins, screen-edge restoration, resize limits, clamped movement, Retina source-pixel mapping, integral crop origins, preserved crop dimensions/aspect, 1:1 edge contrast, and camera aspect-fill/zoom/pan clamping.")
+    }
+
+    static func validateCameraFraming() {
+        precondition(CaptureLayout.allCases == [.single, .stacked], "Only single and stacked layouts should remain")
+        let source = CGSize(width: 1920, height: 1080)
+        let square = CGSize(width: 500, height: 500)
+        let normal = CameraFramingConfiguration()
+        precondition(normal.sourceRect(in: source, filling: square) == CGRect(x: 420, y: 0, width: 1080, height: 1080),
+                     "At 1x, a square camera must aspect-fill rather than stretch")
+        let zoomed = CameraFramingConfiguration(zoom: 2)
+        precondition(zoomed.sourceRect(in: source, filling: square) == CGRect(x: 690, y: 270, width: 540, height: 540),
+                     "Zoom 2 must crop half the source width and height around the center")
+        let topRight = CameraFramingConfiguration(zoom: 2, center: CGPoint(x: 1, y: 0))
+        precondition(topRight.sourceRect(in: source, filling: square) == CGRect(x: 1380, y: 540, width: 540, height: 540),
+                     "Top-left UI coordinates must select the top-right source without exposing an edge")
+        let visible = topRight.centerClamped(in: source, filling: square)
+        precondition(visible.center == CGPoint(x: 1650.0 / 1920.0, y: 0.25),
+                     "The drag origin must resolve to the visible crop center without a dead zone")
+        let invalid = CameraFramingConfiguration(zoom: .nan, center: CGPoint(x: CGFloat.infinity, y: CGFloat.nan)).clamped()
+        precondition(invalid == normal, "Nonfinite stored framing must return safe defaults")
+        precondition(CameraFramingConfiguration(zoom: 99, center: CGPoint(x: -3, y: 5)).clamped()
+            == CameraFramingConfiguration(zoom: 4, center: CGPoint(x: 0, y: 1)), "Framing must respect its public bounds")
+        for source in [CGSize(width: 1920, height: 1080), CGSize(width: 1080, height: 1920), CGSize(width: 640, height: 480)] {
+            for destination in [square, CGSize(width: 800, height: 600), CGSize(width: 1440, height: 384), CGSize(width: 1440, height: 2176)] {
+                for zoom in [-1.0, 1, 1.7, 4, 10, .nan] {
+                    for center in [CGPoint.zero, CGPoint(x: 0.37, y: 0.68), CGPoint(x: 1, y: 1)] {
+                        let framing = CameraFramingConfiguration(zoom: zoom, center: center)
+                        let rect = framing.sourceRect(in: source, filling: destination)
+                        precondition(CGRect(origin: .zero, size: source).insetBy(dx: -0.000001, dy: -0.000001).contains(rect),
+                                     "Every zoomed camera crop must remain inside the native source")
+                        precondition(abs(rect.width / rect.height - destination.width / destination.height) < 0.000001,
+                                     "Framing must retain the destination aspect at every crop and zoom")
+                        let resolved = framing.centerClamped(in: source, filling: destination)
+                            .sourceRect(in: source, filling: destination)
+                        precondition(abs(resolved.minX - rect.minX) < 0.000001 && abs(resolved.minY - rect.minY) < 0.000001,
+                                     "Clamping the drag center must not change the visible crop")
+                    }
+                }
+            }
+        }
+        precondition(normal.sourceRect(in: .zero, filling: square) == .zero,
+                     "A temporarily unavailable camera size must not produce invalid geometry")
     }
 
     static func validateSourcePixelCrop() {

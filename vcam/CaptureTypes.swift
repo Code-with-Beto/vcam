@@ -65,21 +65,64 @@ struct CameraOverlayConfiguration: Sendable, Equatable {
     }
 }
 
+/// Framing samples the camera after mirroring, so panning follows the image the
+/// user sees. `center` is normalized source coordinates measured from top-left.
+/// Zoom 1 is aspect-fill; larger values crop further without changing the frame.
+struct CameraFramingConfiguration: Sendable, Equatable {
+    var zoom: Double = 1
+    var center = CGPoint(x: 0.5, y: 0.5)
+
+    func clamped() -> CameraFramingConfiguration {
+        CameraFramingConfiguration(
+            zoom: zoom.isFinite ? min(max(zoom, 1), 4) : 1,
+            center: CGPoint(x: center.x.isFinite ? min(max(center.x, 0), 1) : 0.5,
+                            y: center.y.isFinite ? min(max(center.y, 0), 1) : 0.5))
+    }
+
+    /// The source crop in Core Image's bottom-left coordinates. The requested
+    /// center is clamped by the crop's half extents, keeping every edge in-bounds.
+    func sourceRect(in sourceSize: CGSize, filling destinationSize: CGSize) -> CGRect {
+        guard sourceSize.width.isFinite, sourceSize.height.isFinite,
+              destinationSize.width.isFinite, destinationSize.height.isFinite,
+              sourceSize.width > 0, sourceSize.height > 0,
+              destinationSize.width > 0, destinationSize.height > 0 else { return .zero }
+        let normalized = clamped()
+        let scale = max(destinationSize.width / sourceSize.width,
+                        destinationSize.height / sourceSize.height)
+        let width = min(sourceSize.width, destinationSize.width / scale) / normalized.zoom
+        let height = min(sourceSize.height, destinationSize.height / scale) / normalized.zoom
+        return CGRect(
+            x: min(max(normalized.center.x * sourceSize.width - width / 2, 0), sourceSize.width - width),
+            y: min(max((1 - normalized.center.y) * sourceSize.height - height / 2, 0), sourceSize.height - height),
+            width: width, height: height)
+    }
+
+    /// Resolve a requested center to the visible crop before starting a drag,
+    /// avoiding a dead zone when the stored center extends beyond a crop edge.
+    func centerClamped(in sourceSize: CGSize, filling destinationSize: CGSize) -> CameraFramingConfiguration {
+        var result = clamped()
+        let crop = result.sourceRect(in: sourceSize, filling: destinationSize)
+        guard !crop.isEmpty else { return result }
+        result.center = CGPoint(x: crop.midX / sourceSize.width, y: 1 - crop.midY / sourceSize.height)
+        return result
+    }
+}
+
 struct CameraConfiguration: Sendable, Equatable {
     var deviceID: String? = nil
     var placement: CameraPlacement = .off
     var overlay = CameraOverlayConfiguration()
     var mirrored = true
+    var framing = CameraFramingConfiguration()
     var isEnabled: Bool { deviceID != nil && placement != .off }
 }
 
 enum CaptureLayout: String, CaseIterable, Identifiable, Sendable {
-    case single, sideBySide, stacked
+    case single, stacked
     var id: String { rawValue }
     var title: String {
         switch self {
         case .single: return "Single region"
-        case .sideBySide: return "Side by side"
         case .stacked: return "Stacked"
         }
     }
@@ -88,8 +131,8 @@ enum CaptureLayout: String, CaseIterable, Identifiable, Sendable {
         value.isFinite ? min(max(value, 0.15), 0.85) : 0.5
     }
 
-    /// Rectangles use Core Image's bottom-left origin. A is left/top and B is
-    /// right/bottom. Encoded output sizes are even; an even split boundary keeps
+    /// Rectangles use Core Image's bottom-left origin. A is top and B is bottom.
+    /// Encoded output sizes are even; an even split boundary keeps
     /// both cells aligned with the encoder's chroma grid, with no canvas gaps.
     func destinationRects(in outputSize: CGSize, splitRatio: Double) -> [CGRect] {
         let canvas = CGRect(origin: .zero, size: outputSize)
@@ -97,10 +140,6 @@ enum CaptureLayout: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .single:
             return [canvas]
-        case .sideBySide:
-            let width = min(max((outputSize.width * ratio / 2).rounded() * 2, 2), outputSize.width - 2)
-            return [CGRect(x: 0, y: 0, width: width, height: outputSize.height),
-                    CGRect(x: width, y: 0, width: outputSize.width - width, height: outputSize.height)]
         case .stacked:
             let height = min(max((outputSize.height * ratio / 2).rounded() * 2, 2), outputSize.height - 2)
             return [CGRect(x: 0, y: outputSize.height - height, width: outputSize.width, height: height),

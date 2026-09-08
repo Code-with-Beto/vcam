@@ -127,8 +127,16 @@ struct ContentView: View {
                 ZStack {
                     CompositionDivider(layout: model.layout,
                         splitRatio: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
-                        isEnabled: !model.isBusy)
-                    if model.cameraPlacement == .overlay {
+                        isEnabled: !model.isBusy && !model.isAdjustingCameraCrop)
+                    if model.isAdjustingCameraCrop, let destination = cameraDestinationRect {
+                        CameraCropControls(
+                            framing: Binding(get: { model.cameraFraming }, set: { model.setCameraFraming($0) }),
+                            sourceSize: model.cameraSourceSize, outputSize: model.outputSize,
+                            destination: destination,
+                            shape: model.cameraPlacement == .overlay ? model.cameraOverlay.shape : nil,
+                            isEnabled: !model.isBusy)
+                        .id(cameraInteractionID)
+                    } else if model.cameraPlacement == .overlay {
                         CameraOverlayControls(
                             configuration: Binding(get: { model.cameraOverlay }, set: { model.setCameraOverlay($0) }),
                             outputSize: model.outputSize, isEnabled: !model.isBusy)
@@ -141,12 +149,33 @@ struct ContentView: View {
     }
 
     private var previewHint: String {
+        if model.isAdjustingCameraCrop {
+            return "Drag inside the camera to frame your face. Use Zoom in Live to crop closer, then choose Done. The camera frame stays in place."
+        }
         if model.cameraPlacement == .overlay {
             return "Drag the camera to move it; use its corner to resize. \(model.hasTwoRegions ? "Drag the divider to adjust the split." : "Changes appear in your take.")"
         }
         return model.hasTwoRegions
             ? "Drag the divider to adjust the split. Move each capture frame independently on your display."
             : "The full capture frame is recorded. Resize this window for a larger preview."
+    }
+
+    private var cameraDestinationRect: CGRect? {
+        switch model.cameraPlacement {
+        case .off: return nil
+        case .overlay: return model.cameraOverlay.rect(in: model.outputSize)
+        case .regionA, .regionB:
+            let regions = model.layout.destinationRects(in: model.outputSize, splitRatio: model.splitRatio)
+            let index = model.cameraPlacement == .regionB ? 1 : 0
+            return regions.indices.contains(index) ? regions[index] : nil
+        }
+    }
+
+    private var cameraInteractionID: String {
+        // Recreate GestureState when the source's coordinate system changes.
+        // An in-progress drag must not reuse its origin after mirroring or
+        // replacing a region with the floating camera.
+        "\(model.selectedCameraID):\(model.cameraPlacement.rawValue):\(model.layout.rawValue):\(model.cameraOverlay.shape.rawValue):\(model.mirrorsCamera)"
     }
 
     private var sidebar: some View {
@@ -185,10 +214,9 @@ struct ContentView: View {
 
     private var compositionSettings: some View {
         VStack(alignment: .leading, spacing: 12) {
-            settingTitle("Layout", help: "Single records one region. Side by side places A left and B right. Stacked places A above B. Switch layouts during a take; the saved video keeps the same resolution and orientation.")
+            settingTitle("Layout", help: "Single records one region. Stacked places A above B. Switch layouts during a take; the saved video keeps the same resolution and orientation.")
             Picker("Composition layout", selection: Binding(get: { model.layout }, set: { model.setLayout($0) })) {
                 Text("Single").tag(CaptureLayout.single)
-                Text("Side by side").tag(CaptureLayout.sideBySide)
                 Text("Stacked").tag(CaptureLayout.stacked)
             }.labelsHidden().pickerStyle(.segmented).disabled(model.isBusy)
             if model.hasTwoRegions {
@@ -218,7 +246,7 @@ struct ContentView: View {
             if model.activeRegionIsCamera {
                 Label("Camera fills \(model.regionTitle(model.selectedRegion))", systemImage: "video.fill")
                     .font(.callout.weight(.medium))
-                Text("Use the split to resize this panel. The camera is cropped to fill without stretching.")
+                Text("Use the split to resize this panel. Use Camera's Zoom and Adjust crop controls to frame your face.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             } else {

@@ -24,6 +24,7 @@ struct CameraSettingsView: View {
                 if model.cameraPlacement != .off {
                     if model.cameraAuthorization != .authorized { permissionControls }
                     if model.cameraPlacement == .overlay { overlayControls }
+                    framingControls
                     HStack {
                         Toggle("Mirror camera", isOn: Binding(
                             get: { model.mirrorsCamera }, set: { model.setMirrorsCamera($0) }
@@ -161,6 +162,59 @@ struct CameraSettingsView: View {
                 SettingHelp("Camera position", "Jump to a corner with a small inset, or drag the camera anywhere in the live preview. The entire camera stays inside the output frame. Check platform captions and controls when choosing a position.")
             }
         }.disabled(!canAdjust)
+    }
+
+    private var framingControls: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Text("Zoom").frame(width: 54, alignment: .leading)
+                Slider(value: Binding(
+                    get: { model.cameraFraming.zoom },
+                    set: { zoom in
+                        var value = model.cameraFraming
+                        value.zoom = zoom
+                        model.setCameraFraming(value)
+                    }
+                ), in: 1...4)
+                .accessibilityLabel("Camera zoom")
+                .accessibilityValue(zoomDescription)
+                Text(zoomDescription).font(.caption.monospacedDigit())
+                    .frame(width: 34, alignment: .trailing)
+                SettingHelp("Camera crop and zoom", "Zoom crops into the camera image without changing the size of its overlay or panel. Choose Adjust crop, then drag inside the camera in the preview to position your face. These changes appear in the current take. Higher zoom uses fewer source pixels, so a closer camera can look sharper.")
+            }
+            HStack(spacing: 10) {
+                Button {
+                    if model.isAdjustingCameraCrop {
+                        model.isAdjustingCameraCrop = false
+                    } else {
+                        Task {
+                            if !model.isPreviewing { await model.togglePreview() }
+                            if model.isPreviewing && model.cameraPlacement != .off {
+                                model.isAdjustingCameraCrop = true
+                            }
+                        }
+                    }
+                } label: {
+                    Label(model.isAdjustingCameraCrop ? "Done" : "Adjust crop",
+                          systemImage: model.isAdjustingCameraCrop ? "checkmark" : "crop")
+                }
+                .disabled(model.requestingCamera)
+                .help(model.isAdjustingCameraCrop ? "Finish framing the camera and return to moving its frame." : "Drag the camera image in the preview to frame your face. Starts preview if needed.")
+                Button("Reset") { model.setCameraFraming(CameraFramingConfiguration()) }
+                    .accessibilityLabel("Reset camera crop and zoom")
+                    .help("Reset camera zoom to 1× and center the image.")
+                Spacer(minLength: 0)
+            }
+            if model.isAdjustingCameraCrop {
+                Text("Drag inside the camera image to frame your face. The frame stays in place until you choose Done.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }.disabled(!canAdjust)
+    }
+
+    private var zoomDescription: String {
+        String(format: "%.1f×", model.cameraFraming.zoom)
     }
 
     private func cornerButton(_ title: String, symbol: String, right: Bool, bottom: Bool) -> some View {

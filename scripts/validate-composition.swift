@@ -58,11 +58,7 @@ struct ValidateComposition {
                     try check(cells.reduce(0) { $0 + $1.width * $1.height } == size.width * size.height, "Cells must cover the entire canvas without gaps")
                     if cells.count == 2 {
                         try check(cells[0].union(cells[1]) == canvas && cells[0].intersection(cells[1]).isEmpty, "Cells overlap or leave a seam")
-                        if layout == .sideBySide {
-                            try check(cells[0].minX == 0 && cells[0].maxX == cells[1].minX, "A must be left of B")
-                        } else {
-                            try check(cells[0].maxY == size.height && cells[0].minY == cells[1].maxY, "A must be above B")
-                        }
+                        try check(cells[0].maxY == size.height && cells[0].minY == cells[1].maxY, "A must be above B")
                     }
                 }
             }
@@ -150,9 +146,7 @@ struct ValidateComposition {
             }
         }
         if phases[0].layout != .single {
-            let crossingPoint = phases[0].layout == .sideBySide
-                ? CGPoint(x: size.width * 0.6, y: size.height * 0.2)
-                : CGPoint(x: size.width * 0.18, y: size.height * 0.4)
+            let crossingPoint = CGPoint(x: size.width * 0.18, y: size.height * 0.4)
             try expect(images[2].pixel(at: crossingPoint), palette[3], "Before moving the split, this pixel must belong to B")
             try expect(images[3].pixel(at: crossingPoint), palette[1], "After moving the split, this pixel must belong to A")
         } else {

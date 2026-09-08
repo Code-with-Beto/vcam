@@ -32,11 +32,14 @@ final class CaptureEngine {
     var onFailure: ((String) -> Void)?
     /// Recoverable camera interruption; screen capture and the current take continue.
     var onCameraFailure: ((String) -> Void)?
+    /// Native camera dimensions, delivered only when a current source changes.
+    var onCameraSourceSize: ((CGSize) -> Void)?
 
     private var stream: SCStream?
     private var worker: CaptureWorker?
     private var generation = UUID()
     private var cameraIntent = UUID()
+    private var cameraSourceSize: CGSize?
     private var isStarting = false
 
     func startPreview(configuration: CaptureConfiguration) async throws {
@@ -120,7 +123,16 @@ final class CaptureEngine {
         newWorker.onCameraFailure = { [weak self] message, intent in
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token, self.cameraIntent == intent else { return }
+                self.cameraIntent = UUID()
                 self.onCameraFailure?(message)
+            }
+        }
+        newWorker.onCameraSourceSize = { [weak self] size, intent in
+            Task { @MainActor [weak self] in
+                guard let self, self.generation == token, self.cameraIntent == intent,
+                      self.cameraSourceSize != size else { return }
+                self.cameraSourceSize = size
+                self.onCameraSourceSize?(size)
             }
         }
         let newStream = SCStream(filter: filter, configuration: settings, delegate: newWorker)
@@ -182,6 +194,7 @@ final class CaptureEngine {
     func stopPreview() async {
         generation = UUID()
         cameraIntent = UUID()
+        cameraSourceSize = nil
         let oldStream = stream
         let oldWorker = worker
         stream = nil
@@ -214,6 +227,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     var onAudioChannel: (@Sendable (Int) -> Void)?
     var onFailure: (@Sendable (String) -> Void)?
     var onCameraFailure: (@Sendable (String, UUID) -> Void)?
+    var onCameraSourceSize: (@Sendable (CGSize, UUID) -> Void)?
 
     private let configuration: CaptureConfiguration
     private let context = CIContext(options: [
@@ -237,6 +251,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     private var cameraStartError: String?
     private var cameraConfiguration: CameraConfiguration
     private var latestCameraBuffer: CVPixelBuffer?
+    private var cameraSourceSize: CGSize?
     private var lastCameraAt: CFTimeInterval?
     private var selectedMicrophoneChannel: Int?
     private var latchedMicrophoneChannel: Int?
@@ -282,6 +297,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         cameraConfiguration = configuration.camera
         cameraConfiguration.placement = .off // Publish enabled placement only after its first frame.
         cameraConfiguration.overlay = configuration.camera.overlay.clamped(in: configuration.outputSize)
+        cameraConfiguration.framing = configuration.camera.framing.clamped()
         composition = CaptureComposition(layout: configuration.layout,
             splitRatio: CaptureLayout.clampedSplitRatio(configuration.splitRatio),
             primaryFrame: configuration.captureFrame, secondaryFrame: configuration.secondaryCaptureFrame)
@@ -354,6 +370,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         }
         var normalized = requested
         normalized.overlay = requested.overlay.clamped(in: outputRect.size)
+        normalized.framing = requested.framing.clamped()
         let target = normalized
         let token = UUID()
         let transition: (old: (any CameraCaptureSession)?, new: (any CameraCaptureSession)?) = try await withCheckedThrowingContinuation { continuation in
@@ -363,6 +380,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                 if target.isEnabled, self.cameraCapture != nil, !self.cameraStarting,
                    self.cameraConfiguration.isEnabled, self.cameraConfiguration.deviceID == target.deviceID {
                     self.cameraConfiguration = target
+                    if let size = self.cameraSourceSize { self.onCameraSourceSize?(size, intent) }
                     continuation.resume(returning: (nil, nil))
                     return
                 }
@@ -372,6 +390,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                 self.cameraStarting = target.isEnabled
                 self.cameraStartError = nil
                 self.latestCameraBuffer = nil
+                self.cameraSourceSize = nil
                 self.lastCameraAt = nil
                 self.cameraConfiguration = target
                 self.cameraConfiguration.placement = .off
@@ -392,6 +411,11 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                     guard let self, self.active, self.cameraGeneration == token, self.cameraCapture != nil else { return }
                     self.latestCameraBuffer = buffer
                     self.lastCameraAt = CACurrentMediaTime()
+                    let size = CGSize(width: CVPixelBufferGetWidth(buffer), height: CVPixelBufferGetHeight(buffer))
+                    if size.width > 0, size.height > 0, size != self.cameraSourceSize {
+                        self.cameraSourceSize = size
+                        self.onCameraSourceSize?(size, self.cameraIntent)
+                    }
                 }, onFailure: { [weak self] message in
                     self?.queue.async { [weak self] in self?.cameraFailed(message, token: token) }
                 })
@@ -412,6 +436,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                         self.cameraGeneration = UUID()
                         self.cameraCapture = nil
                         self.latestCameraBuffer = nil
+                        self.cameraSourceSize = nil
                         self.cameraStarting = false
                         self.cameraStartError = nil
                         self.cameraConfiguration.placement = .off
@@ -451,6 +476,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         cameraGeneration = UUID()
         cameraCapture = nil
         latestCameraBuffer = nil
+        cameraSourceSize = nil
         cameraConfiguration.placement = .off
         onCameraFailure?(message, cameraIntent)
         Task { await camera.stop() }
@@ -467,6 +493,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
               configuration.isEnabled, cameraConfiguration.isEnabled, !cameraStarting else { return }
         cameraConfiguration = configuration
         cameraConfiguration.overlay = configuration.overlay.clamped(in: outputRect.size)
+        cameraConfiguration.framing = configuration.framing.clamped()
     }
 
     func previewWasDelivered() {
@@ -665,6 +692,7 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                 self.timer = nil
                 self.latestBuffer = nil
                 self.latestCameraBuffer = nil
+                self.cameraSourceSize = nil
                 self.previewPool = nil
                 self.expectedStream = nil
                 if let observer = self.disconnectObserver {
@@ -799,15 +827,15 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
             switch cameraConfiguration.placement {
             case .off: break
             case .regionA:
-                result = fittedImage(camera, crop: camera.extent, destination: destinations[0]).composited(over: result)
+                result = framedCameraImage(camera, destination: destinations[0]).composited(over: result)
             case .regionB:
                 if destinations.count > 1 {
-                    result = fittedImage(camera, crop: camera.extent, destination: destinations[1]).composited(over: result)
+                    result = framedCameraImage(camera, destination: destinations[1]).composited(over: result)
                 }
             case .overlay:
                 let overlay = cameraConfiguration.overlay
                 let rect = overlay.rect(in: outputRect.size)
-                let image = fittedImage(camera, crop: camera.extent, destination: rect)
+                let image = framedCameraImage(camera, destination: rect)
                 let radius = overlay.shape == .circle ? rect.width / 2 : rect.height * 0.14
                 let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
                     "inputExtent": CIVector(cgRect: rect), "inputRadius": radius, "inputColor": CIColor.white
@@ -823,6 +851,12 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     private func regionImage(_ source: CIImage, frame: CGRect, destination: CGRect) -> CIImage {
         let crop = CaptureGeometry.sourcePixelCrop(frame,
             displayFrame: configuration.displayFrame, pixelSize: source.extent.size)
+        return fittedImage(source, crop: crop, destination: destination)
+    }
+
+    private func framedCameraImage(_ source: CIImage, destination: CGRect) -> CIImage {
+        let crop = cameraConfiguration.framing.sourceRect(in: source.extent.size, filling: destination.size)
+            .offsetBy(dx: source.extent.minX, dy: source.extent.minY)
         return fittedImage(source, crop: crop, destination: destination)
     }
 
@@ -1105,6 +1139,7 @@ private final class SyntheticCameraHolder: @unchecked Sendable {
 private final class SyntheticLifecycleState: @unchecked Sendable {
     var audioSamples = 0
     var recoverableErrors = 0
+    var cameraSizes: [CGSize] = []
     var fatalError: String?
 }
 // Compiled only by scripts/validate-capture.swift. Synthetic inputs exercise the
@@ -1134,6 +1169,7 @@ extension CaptureWorker {
                 worker.latestBuffer = frame.buffer
                 worker.onFailure = { state.fatalError = $0 }
                 worker.onCameraFailure = { _, _ in state.recoverableErrors += 1 }
+                worker.onCameraSourceSize = { size, _ in state.cameraSizes.append(size) }
                 audioTimer.schedule(deadline: .now(), repeating: .milliseconds(10))
                 audioTimer.setEventHandler {
                     let elapsed = CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), audioOrigin).seconds
@@ -1183,6 +1219,8 @@ extension CaptureWorker {
             try await Task.sleep(for: .milliseconds(100))
             try await worker.requireSyntheticState({ $0.writer.map(ObjectIdentifier.init) == originalWriter && $0.cameraConfiguration.isEnabled && state.recoverableErrors == 0 && state.fatalError == nil },
                 "A stopped camera's late callback affected its replacement or the writer.")
+            try await worker.requireSyntheticState({ _ in state.cameraSizes == [bounds.size, bounds.size] },
+                "Camera size must publish once per new source, ignoring repeated frames and late callbacks from stopped cameras.")
             await withCheckedContinuation { continuation in
                 worker.queue.async {
                     worker.cameraFailed("Synthetic active camera disconnected.", token: worker.cameraGeneration)
@@ -1192,6 +1230,8 @@ extension CaptureWorker {
             try await Task.sleep(for: .milliseconds(60))
             try await worker.requireSyntheticState({ $0.writer.map(ObjectIdentifier.init) == originalWriter && !$0.cameraConfiguration.isEnabled && state.recoverableErrors == 1 && state.fatalError == nil },
                 "An active camera interruption must recover to screen-only without cancelling the take.")
+            try await worker.requireSyntheticState({ _ in state.cameraSizes.count == 2 },
+                "A disconnected camera's late frame republished stale dimensions.")
             on.placement = .regionA
             try await worker.setCamera(on)
             try await worker.discardRecording()
@@ -1307,12 +1347,22 @@ extension CaptureWorker {
             try await worker.startCamera()
             await worker.beginRendering(clock: CMClockGetHostTimeClock())
             try await worker.startRecording(to: url)
+            let originalWriter: ObjectIdentifier = await withCheckedContinuation { continuation in
+                worker.queue.async { continuation.resume(returning: ObjectIdentifier(worker.writer!)) }
+            }
             var times: [Double] = []
             for (index, phase) in phases.enumerated() {
                 worker.updateComposition(primaryFrame: phase.primaryFrame, secondaryFrame: phase.secondaryFrame,
                     layout: phase.layout, splitRatio: phase.splitRatio)
                 if cameras.indices.contains(index) {
-                    try await worker.setCamera(cameras[index])
+                    let previous = index > 0 ? cameras[index - 1] : config.camera
+                    if previous.isEnabled, cameras[index].isEnabled, previous.deviceID == cameras[index].deviceID {
+                        // Exercise the same inexpensive live edit path used by
+                        // zoom, panning, mirroring, and placement controls.
+                        worker.updateCamera(cameras[index])
+                    } else {
+                        try await worker.setCamera(cameras[index])
+                    }
                     if !cameras[index].isEnabled {
                         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                             worker.queue.async {
@@ -1325,6 +1375,8 @@ extension CaptureWorker {
                         }
                     }
                 }
+                try await worker.requireSyntheticState({ $0.writer.map(ObjectIdentifier.init) == originalWriter },
+                    "A live layout or camera framing edit replaced the ongoing writer.")
                 let phaseStart: Double = await withCheckedContinuation { continuation in
                     worker.queue.async {
                         continuation.resume(returning: CMTimeSubtract(worker.captureTime()!, worker.firstVideoTime!).seconds)
