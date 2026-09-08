@@ -89,6 +89,7 @@ final class RecorderModel {
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var recordingStart: Date?
     @ObservationIgnored private var securityScopedFolder: URL?
+    @ObservationIgnored private var lastRecordingFolder: URL?
     @ObservationIgnored private var hasPrepared = false
     @ObservationIgnored private var isShuttingDown = false
     @ObservationIgnored private var transitionWaiters: [CheckedContinuation<Void, Never>] = []
@@ -392,7 +393,9 @@ final class RecorderModel {
         do {
             if let url = try await engine.stopRecording() {
                 lastRecording = url
+                lastRecordingFolder = outputFolder
                 notice = "Saved \(url.lastPathComponent)"
+                await openRecordingInQuickTime(url, folder: lastRecordingFolder)
             }
         } catch { errorMessage = error.localizedDescription }
     }
@@ -423,7 +426,27 @@ final class RecorderModel {
 
     func openLastRecording() {
         guard let lastRecording else { return }
-        NSWorkspace.shared.open(lastRecording)
+        let folder = lastRecordingFolder
+        Task { await openRecordingInQuickTime(lastRecording, folder: folder) }
+    }
+
+    private func openRecordingInQuickTime(_ url: URL, folder: URL?) async {
+        let workspace = NSWorkspace.shared
+        guard let application = workspace.urlForApplication(withBundleIdentifier: "com.apple.QuickTimePlayerX") else {
+            notice = "Saved \(url.lastPathComponent). QuickTime Player is unavailable. Use Reveal to find the video."
+            return
+        }
+        // Keep the original folder's grant while Launch Services opens the file,
+        // including when Play is used after selecting a different save folder.
+        let hasAccess = folder?.startAccessingSecurityScopedResource() == true
+        defer { if hasAccess { folder?.stopAccessingSecurityScopedResource() } }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        do {
+            _ = try await workspace.open([url], withApplicationAt: application, configuration: configuration)
+        } catch {
+            notice = "Saved \(url.lastPathComponent). QuickTime Player could not open it: \(error.localizedDescription)"
+        }
     }
 
     func openScreenPermissions() {

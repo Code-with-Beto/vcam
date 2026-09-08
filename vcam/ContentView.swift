@@ -197,7 +197,7 @@ struct ContentView: View {
                 Image(systemName: "folder").foregroundStyle(.secondary)
                 Text(model.outputFolder?.lastPathComponent ?? "Save folder").lineLimit(1).help(model.outputFolder?.path ?? "Choose an output folder")
                 Button(model.outputFolder == nil ? "Choose…" : "Change…") { model.chooseOutputFolder() }.disabled(model.isRecording || model.isBusy)
-                SettingHelp("Save folder", "Choose where recordings are saved. vcam remembers permission for this folder. Each take gets a unique filename; stopping finalizes the MP4 before Play and Reveal become available.")
+                SettingHelp("Save folder", "Choose where recordings are saved. vcam remembers permission for this folder. Each take gets a unique filename and opens in QuickTime Player after saving. Use Play to reopen it or Reveal to find the file.")
             }
             if model.isPreviewing && !model.isRecording {
                 Text("Stop preview to change output, frame rate, microphone, or cursor.").font(.caption).foregroundStyle(.secondary)

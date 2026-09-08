@@ -24,6 +24,7 @@ open vcam/vcam.xcodeproj
 1. Select the **vcam** scheme and **My Mac**. Choose your signing team under **Signing & Capabilities**, then press **⌘R**.
 2. Follow the access setup, select your microphone, and choose a save folder.
 3. Click **Show frame**, position your content, and start preview. Press **Record** when ready.
+4. Stop recording to save the video and open it automatically in **QuickTime Player**.
 
 **⇧⌘R** starts or stops recording. **⇧⌘F** shows or hides the frame while idle.
 
