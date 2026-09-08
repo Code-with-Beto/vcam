@@ -7,6 +7,7 @@ Built for our own workflow at Code with Beto. This is an early version and will 
 ## Features
 
 - A movable 9:16 recording frame, with free, horizontal, and vertical movement.
+- Two independent regions in side-by-side or stacked layouts, with a divider you can adjust while recording.
 - Composition and caption guides that do not appear in the saved video.
 - Live preview, microphone selection, input-channel controls, and a decibel meter.
 - 1080 × 1920 or 1440 × 2560 (2K) MP4 export at 30 or 60 fps.
@@ -23,7 +24,7 @@ open vcam/vcam.xcodeproj
 
 1. Select the **vcam** scheme and **My Mac**. Choose your signing team under **Signing & Capabilities**, then press **⌘R**.
 2. Follow the access setup, select your microphone, and choose a save folder.
-3. Click **Show frame**, position your content, and start preview. Press **Record** when ready.
+3. Choose **Single region**, **Side by side**, or **Stacked**, then show and position the frames. Start preview and press **Record** when ready. In split layouts, drag the preview divider to adjust the balance; both regions are saved in one video.
 4. Stop recording to save the video and open it automatically in **QuickTime Player**.
 
 **⇧⌘R** starts or stops recording. **⇧⌘F** shows or hides the frame while idle.

@@ -18,6 +18,11 @@ struct MicrophoneChoice: Identifiable {
     let channels: Int
 }
 
+enum CaptureRegion: String, CaseIterable, Identifiable {
+    case primary, secondary
+    var id: String { rawValue }
+}
+
 @MainActor
 @Observable
 final class RecorderModel {
@@ -46,7 +51,14 @@ final class RecorderModel {
         didSet { UserDefaults.standard.set(orientation.rawValue, forKey: "orientation") }
     }
     var resolution: OutputResolution = .qhd {
-        didSet { UserDefaults.standard.set(resolution.rawValue, forKey: "resolution") }
+        didSet {
+            UserDefaults.standard.set(resolution.rawValue, forKey: "resolution")
+            if hasPrepared {
+                refitFrames(preserveHeight: layout == .sideBySide)
+                saveFramePosition()
+                refreshOverlay()
+            }
+        }
     }
     var microphoneChannel = -1 {
         didSet { UserDefaults.standard.set(microphoneChannel, forKey: "microphoneChannel") }
@@ -58,6 +70,10 @@ final class RecorderModel {
     private(set) var requestedScreenAccess = false
     var frameWidth: Double
     private(set) var captureFrame = CGRect.zero
+    private(set) var secondaryCaptureFrame = CGRect.zero
+    private(set) var layout: CaptureLayout = .single
+    private(set) var splitRatio: Double = 0.5
+    private(set) var selectedRegion: CaptureRegion = .primary
     private(set) var isFrameVisible = false
     private(set) var isPreviewing = false
     private(set) var isRecording = false
@@ -83,6 +99,7 @@ final class RecorderModel {
 
     @ObservationIgnored private let engine = CaptureEngine()
     @ObservationIgnored private let overlay = FrameOverlayController()
+    @ObservationIgnored private let secondaryOverlay = FrameOverlayController()
     @ObservationIgnored private var shortcuts: GlobalShortcuts?
     @ObservationIgnored private var displayObserver: NSObjectProtocol?
     @ObservationIgnored private var activationObserver: NSObjectProtocol?
@@ -95,6 +112,11 @@ final class RecorderModel {
     @ObservationIgnored private var transitionWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var displayRevision = 0
     @ObservationIgnored private var captureRevision = 0
+    // Keep the requested scale when a split temporarily runs into a display edge.
+    // Returning the divider restores that scale instead of accumulating zoom changes.
+    @ObservationIgnored private var primarySplitExtent: CGFloat = 0
+    @ObservationIgnored private var secondarySplitExtent: CGFloat = 0
+    @ObservationIgnored private var secondaryOutputCell: CGRect?
 
     init() {
         let defaults = UserDefaults.standard
@@ -108,6 +130,9 @@ final class RecorderModel {
         showsGuides = defaults.object(forKey: "showsGuides") as? Bool ?? true
         frameWidth = defaults.object(forKey: "frameWidth") as? Double ?? 360
         orientation = CaptureOrientation(rawValue: defaults.string(forKey: "orientation") ?? "") ?? .portrait
+        layout = CaptureLayout(rawValue: defaults.string(forKey: "captureLayout") ?? "") ?? .single
+        let savedSplit = defaults.object(forKey: "splitRatio") as? Double ?? 0.5
+        splitRatio = savedSplit.isFinite ? min(max(savedSplit, 0.15), 0.85) : 0.5
         resolution = OutputResolution(rawValue: defaults.integer(forKey: "resolution")) ?? .qhd
         reservesCaptions = defaults.bool(forKey: "reservesCaptions")
         microphoneChannel = defaults.object(forKey: "microphoneChannel") as? Int ?? -1
@@ -123,13 +148,25 @@ final class RecorderModel {
         overlay.onFrameChanged = { [weak self] rect in
             guard let self else { return }
             self.captureFrame = rect
-            self.engine.updateCrop(rect)
+            self.updateComposition()
             self.saveFramePosition()
         }
+        secondaryOverlay.onFrameChanged = { [weak self] rect in
+            guard let self else { return }
+            self.secondaryCaptureFrame = rect
+            self.updateComposition()
+            self.saveFramePosition()
+        }
+        overlay.onSelect = { [weak self] in self?.selectRegion(.primary) }
+        secondaryOverlay.onSelect = { [weak self] in self?.selectRegion(.secondary) }
         overlay.onToggleRecording = { [weak self] in
             Task { await self?.toggleRecording() }
         }
         overlay.onHide = { [weak self] in self?.toggleFrame() }
+        secondaryOverlay.onToggleRecording = { [weak self] in
+            Task { await self?.toggleRecording() }
+        }
+        secondaryOverlay.onHide = { [weak self] in self?.toggleFrame() }
     }
 
     var outputSize: CGSize { resolution.size(for: orientation) }
@@ -139,18 +176,26 @@ final class RecorderModel {
     var decibelText: String { audioDecibels <= -100 ? "−∞ dBFS" : String(format: "%.1f dBFS", audioDecibels) }
     var permissionsReady: Bool { screenAccessGranted && (selectedMicrophoneID.isEmpty || microphoneAuthorization == .authorized) }
     var selectedDisplay: DisplayChoice? { displays.first { $0.id == selectedDisplayID } }
+    var hasTwoRegions: Bool { layout != .single }
+    var activeCaptureFrame: CGRect { selectedRegion == .primary ? captureFrame : secondaryCaptureFrame }
+    var activeOutputRect: CGRect { destinationRect(for: selectedRegion) }
+    var activeAspectRatio: CGFloat { activeOutputRect.width / max(activeOutputRect.height, 1) }
+    var activeAspectLabel: String { hasTwoRegions ? "Matches output panel" : orientation.ratioLabel + " linked" }
+    var splitDescription: String { "A \(Int((splitRatio * 100).rounded()))% · B \(100 - Int((splitRatio * 100).rounded()))%" }
+    var minimumFrameWidth: Double { min(hasTwoRegions ? min(180, 180 * activeAspectRatio) : 180, maximumFrameWidth) }
     var elapsedText: String { String(format: "%02d:%02d", elapsedSeconds / 60, elapsedSeconds % 60) }
     var maximumFrameWidth: Double {
         guard let display = selectedDisplay else { return 540 }
-        return min(display.visibleFrame.width, display.visibleFrame.height * orientation.aspectRatio)
+        return min(display.visibleFrame.width, display.visibleFrame.height * activeAspectRatio)
     }
     var sourceSizeText: String {
         guard let display = selectedDisplay else { return "Select a display" }
-        return "\(Int((captureFrame.width * display.scale).rounded())) × \(Int((captureFrame.height * display.scale).rounded())) source pixels"
+        let frame = activeCaptureFrame
+        return "\(Int((frame.width * display.scale).rounded())) × \(Int((frame.height * display.scale).rounded())) source pixels"
     }
     var isUpscaling: Bool {
         guard let display = selectedDisplay else { return false }
-        return captureFrame.width * display.scale < outputSize.width - 1 || captureFrame.height * display.scale < outputSize.height - 1
+        return activeCaptureFrame.width * display.scale < activeOutputRect.width - 1 || activeCaptureFrame.height * display.scale < activeOutputRect.height - 1
     }
     var statusText: String {
         if isBusy { return "Working…" }
@@ -224,7 +269,109 @@ final class RecorderModel {
         resizeFrame()
     }
 
-    func setFrameHeight(_ height: Double) { setFrameWidth(height * orientation.aspectRatio) }
+    func setFrameHeight(_ height: Double) { setFrameWidth(height * activeAspectRatio) }
+
+    func regionTitle(_ region: CaptureRegion) -> String {
+        if layout == .single { return "Frame" }
+        if layout == .stacked { return region == .primary ? "A · Top" : "B · Bottom" }
+        return region == .primary ? "A · Left" : "B · Right"
+    }
+
+    func selectRegion(_ region: CaptureRegion) {
+        guard !isBusy, selectedRegion != region, region == .primary || hasTwoRegions else { return }
+        commitFrameEdits?()
+        selectedRegion = region
+        frameWidth = activeCaptureFrame.width
+        refreshOverlay()
+    }
+
+    func setLayout(_ value: CaptureLayout) {
+        guard !isRecording && !isBusy && !isShuttingDown, value != layout else { return }
+        commitFrameEdits?()
+        let previousCells = [destinationRect(for: .primary), secondaryOutputCell ?? destinationRect(for: .secondary)]
+        layout = value
+        if value == .single { selectedRegion = .primary }
+        remapFrames(from: previousCells)
+        saveFramePosition()
+        updateComposition()
+        if isFrameVisible { showFrame() }
+    }
+
+    func setSplitRatio(_ value: Double) {
+        guard hasTwoRegions && !isBusy && !isShuttingDown, value.isFinite else { return }
+        let value = min(max(value, 0.15), 0.85)
+        guard abs(value - splitRatio) > 0.0001 else { return }
+        commitFrameEdits?()
+        splitRatio = value
+        refitFrames(preserveHeight: layout == .sideBySide, preserveSplitScale: true)
+        saveFramePosition()
+        updateComposition()
+        refreshOverlay()
+    }
+
+    private func destinationRect(for region: CaptureRegion) -> CGRect {
+        let rects = layout.destinationRects(in: outputSize, splitRatio: splitRatio)
+        return region == .secondary && rects.count > 1 ? rects[1] : rects[0]
+    }
+
+    private func remapFrames(from previousCells: [CGRect]) {
+        func remap(_ frame: CGRect, region: CaptureRegion, previous: CGRect) -> CGRect {
+            guard !frame.isEmpty else { return frame }
+            let cell = destinationRect(for: region)
+            let width = frame.width * cell.width / max(previous.width, 1)
+            let height = frame.height * cell.height / max(previous.height, 1)
+            return CGRect(x: frame.midX - width / 2, y: frame.midY - height / 2, width: width, height: height)
+        }
+        captureFrame = remap(captureFrame, region: .primary, previous: previousCells[0])
+        if hasTwoRegions {
+            secondaryCaptureFrame = remap(secondaryCaptureFrame, region: .secondary, previous: previousCells[1])
+        }
+        refitFrames(preserveHeight: false)
+    }
+
+    private func fittedFrame(_ frame: CGRect, for region: CaptureRegion, preserveHeight: Bool,
+                             requestedExtent: CGFloat? = nil) -> CGRect {
+        guard let display = selectedDisplay else { return frame }
+        let cell = destinationRect(for: region)
+        let aspect = cell.width / max(cell.height, 1)
+        let extent = requestedExtent ?? (preserveHeight ? frame.height : frame.width)
+        let width = preserveHeight ? extent * aspect : extent
+        return CaptureGeometry.frame(width: width,
+            centeredAt: CGPoint(x: frame.midX, y: frame.midY),
+            within: frameBounds(for: display), aspectRatio: aspect, minimumWidth: 1)
+    }
+
+    private func refitFrames(preserveHeight: Bool, preserveSplitScale: Bool = false) {
+        guard let display = selectedDisplay else { return }
+        captureFrame = fittedFrame(captureFrame, for: .primary, preserveHeight: preserveHeight,
+            requestedExtent: preserveSplitScale && primarySplitExtent > 0 ? primarySplitExtent : nil)
+        if hasTwoRegions {
+            if secondaryCaptureFrame.isEmpty {
+                let bounds = frameBounds(for: display)
+                let cell = destinationRect(for: .secondary)
+                let aspect = cell.width / max(cell.height, 1)
+                let width = layout == .sideBySide ? captureFrame.height * aspect : captureFrame.width
+                secondaryCaptureFrame = CaptureGeometry.frame(width: width,
+                    centeredAt: CGPoint(x: bounds.minX + bounds.width * 0.25, y: bounds.midY),
+                    within: bounds, aspectRatio: aspect, minimumWidth: 1)
+            } else {
+                secondaryCaptureFrame = fittedFrame(secondaryCaptureFrame, for: .secondary, preserveHeight: preserveHeight,
+                    requestedExtent: preserveSplitScale && secondarySplitExtent > 0 ? secondarySplitExtent : nil)
+            }
+            secondaryOutputCell = destinationRect(for: .secondary)
+        }
+        if !preserveSplitScale {
+            primarySplitExtent = layout == .sideBySide ? captureFrame.height : captureFrame.width
+            secondarySplitExtent = layout == .sideBySide ? secondaryCaptureFrame.height : secondaryCaptureFrame.width
+        }
+        frameWidth = activeCaptureFrame.width
+    }
+
+    private func updateComposition() {
+        engine.updateComposition(primaryFrame: captureFrame,
+            secondaryFrame: hasTwoRegions ? secondaryCaptureFrame : nil,
+            layout: layout, splitRatio: splitRatio)
+    }
 
     func setOrientation(_ value: CaptureOrientation) async {
         guard !isRecording && !isBusy && !isShuttingDown, orientation != value else { return }
@@ -239,14 +386,10 @@ final class RecorderModel {
             audioLevel = 0
             audioDecibels = -120
         }
-        guard !isShuttingDown, let display = selectedDisplay else { return }
+        guard !isShuttingDown, selectedDisplay != nil else { return }
+        let previousCells = CaptureRegion.allCases.map { destinationRect(for: $0) }
         orientation = value
-        let oldHeight = captureFrame.height
-        frameWidth = min(oldHeight, maximumFrameWidth)
-        captureFrame = CaptureGeometry.frame(width: frameWidth,
-            centeredAt: CGPoint(x: captureFrame.midX, y: captureFrame.midY),
-            within: frameBounds(for: display), aspectRatio: value.aspectRatio)
-        UserDefaults.standard.set(frameWidth, forKey: "frameWidth")
+        remapFrames(from: previousCells)
         saveFramePosition()
         refreshOverlay()
         if wasPreviewing {
@@ -289,21 +432,34 @@ final class RecorderModel {
         guard !isPreviewing && !isBusy && !isShuttingDown else { return }
         selectedDisplayID = id
         guard let display = selectedDisplay else { return }
-        frameWidth = min(frameWidth, maximumFrameWidth)
-        captureFrame = CaptureGeometry.initialFrame(in: frameBounds(for: display), preferredWidth: frameWidth, aspectRatio: orientation.aspectRatio)
+        selectedRegion = .primary
+        let cell = destinationRect(for: .primary)
+        captureFrame = CaptureGeometry.initialFrame(in: frameBounds(for: display), preferredWidth: captureFrame.width,
+            aspectRatio: cell.width / max(cell.height, 1))
+        secondaryCaptureFrame = .zero
+        secondaryOutputCell = nil
+        refitFrames(preserveHeight: false)
         saveFramePosition()
         refreshOverlay()
     }
 
     func resizeFrame() {
         guard !isRecording && !isBusy, let display = selectedDisplay else { return }
-        frameWidth = min(max(frameWidth, 180), maximumFrameWidth)
-        captureFrame = CaptureGeometry.frame(width: frameWidth,
-                                             centeredAt: CGPoint(x: captureFrame.midX, y: captureFrame.midY),
-                                             within: frameBounds(for: display), aspectRatio: orientation.aspectRatio)
-        UserDefaults.standard.set(frameWidth, forKey: "frameWidth")
+        frameWidth = min(max(frameWidth, minimumFrameWidth), maximumFrameWidth)
+        let current = activeCaptureFrame
+        let resized = CaptureGeometry.frame(width: frameWidth,
+            centeredAt: CGPoint(x: current.midX, y: current.midY),
+            within: frameBounds(for: display), aspectRatio: activeAspectRatio, minimumWidth: minimumFrameWidth)
+        if selectedRegion == .primary {
+            captureFrame = resized
+            primarySplitExtent = layout == .sideBySide ? resized.height : resized.width
+        } else {
+            secondaryCaptureFrame = resized
+            secondarySplitExtent = layout == .sideBySide ? resized.height : resized.width
+        }
+        frameWidth = activeCaptureFrame.width
         saveFramePosition()
-        engine.updateCrop(captureFrame)
+        updateComposition()
         refreshOverlay()
     }
 
@@ -311,13 +467,22 @@ final class RecorderModel {
         guard !isRecording && !isBusy && !isShuttingDown else { return }
         if isFrameVisible {
             overlay.hide()
+            secondaryOverlay.hide()
             isFrameVisible = false
         } else { showFrame() }
     }
 
     func showFrame() {
         guard !isShuttingDown, let display = selectedDisplay else { return }
-        overlay.show(frame: captureFrame, displayFrame: display.visibleFrame, guides: showsGuides, guideBottomInset: guideBottomInset)
+        overlay.show(frame: captureFrame, displayFrame: display.visibleFrame, guides: showsGuides,
+            guideBottomInset: layout == .stacked ? 0.08 : guideBottomInset,
+            label: hasTwoRegions ? regionTitle(.primary) : nil, accent: .systemCyan,
+            isSelected: selectedRegion == .primary)
+        if hasTwoRegions {
+            secondaryOverlay.show(frame: secondaryCaptureFrame, displayFrame: display.visibleFrame, guides: showsGuides,
+                guideBottomInset: guideBottomInset, label: regionTitle(.secondary), accent: .systemOrange,
+                isSelected: selectedRegion == .secondary)
+        } else { secondaryOverlay.hide() }
         isFrameVisible = true
         refreshOverlay()
     }
@@ -463,6 +628,7 @@ final class RecorderModel {
         isBusy = true
         await engine.stopPreview()
         overlay.hide()
+        secondaryOverlay.hide()
         timer?.invalidate()
         releaseOutputFolder()
         isPreviewing = false
@@ -485,19 +651,32 @@ final class RecorderModel {
             framesPerSecond: framesPerSecond,
             microphoneID: selectedMicrophoneID.isEmpty ? nil : selectedMicrophoneID,
             showsCursor: showsCursor, outputSize: outputSize,
-            microphoneChannel: microphoneChannel < 0 ? nil : microphoneChannel
+            microphoneChannel: microphoneChannel < 0 ? nil : microphoneChannel,
+            secondaryCaptureFrame: hasTwoRegions ? secondaryCaptureFrame : nil,
+            layout: layout, splitRatio: splitRatio
         ))
         guard !isShuttingDown, revision == displayRevision else {
             await engine.stopPreview()
             throw CancellationError()
         }
+        // Handles can move while ScreenCaptureKit is starting. Reconcile the
+        // latest source frames after the worker exists, before exposing preview.
+        updateComposition()
         isPreviewing = true
     }
 
     private func refreshOverlay() {
         guard isFrameVisible, let display = selectedDisplay else { return }
         overlay.update(frame: captureFrame, displayFrame: display.visibleFrame,
-                       guides: showsGuides, recording: isRecording, guideBottomInset: guideBottomInset)
+            guides: showsGuides, recording: isRecording,
+            guideBottomInset: layout == .stacked ? 0.08 : guideBottomInset,
+            label: hasTwoRegions ? regionTitle(.primary) : nil, accent: .systemCyan,
+            isSelected: selectedRegion == .primary)
+        if hasTwoRegions {
+            secondaryOverlay.update(frame: secondaryCaptureFrame, displayFrame: display.visibleFrame,
+                guides: showsGuides, recording: isRecording, guideBottomInset: guideBottomInset,
+                label: regionTitle(.secondary), accent: .systemOrange, isSelected: selectedRegion == .secondary)
+        } else { secondaryOverlay.hide() }
     }
 
     private func frameBounds(for display: DisplayChoice) -> CGRect {
@@ -513,15 +692,36 @@ final class RecorderModel {
             selectedDisplayID = savedDisplay.id
         }
         let target = selectedDisplay ?? display
-        frameWidth = min(max(frameWidth, 180), maximumFrameWidth)
+        selectedRegion = .primary
+        let primaryCell = destinationRect(for: .primary)
+        let primaryAspect = primaryCell.width / max(primaryCell.height, 1)
+        frameWidth = defaults.object(forKey: "frameWidth") as? Double ?? frameWidth
         if defaults.object(forKey: "frameX") != nil && Int(target.id) == savedID {
             captureFrame = CaptureGeometry.frame(width: frameWidth,
                                                  centeredAt: CGPoint(x: defaults.double(forKey: "frameX"),
                                                                      y: defaults.double(forKey: "frameY")),
-                                                 within: frameBounds(for: target), aspectRatio: orientation.aspectRatio)
+                                                 within: frameBounds(for: target), aspectRatio: primaryAspect, minimumWidth: 1)
         } else {
-            captureFrame = CaptureGeometry.initialFrame(in: frameBounds(for: target), preferredWidth: frameWidth, aspectRatio: orientation.aspectRatio)
+            captureFrame = CaptureGeometry.initialFrame(in: frameBounds(for: target), preferredWidth: frameWidth, aspectRatio: primaryAspect)
         }
+        secondaryCaptureFrame = .zero
+        secondaryOutputCell = nil
+        let secondaryDisplayID = defaults.object(forKey: "secondaryFrameDisplayID") as? Int ?? savedID
+        if defaults.object(forKey: "secondaryFrameWidth") != nil, Int(target.id) == secondaryDisplayID {
+            let cell = destinationRect(for: .secondary)
+            let width = defaults.double(forKey: "secondaryFrameWidth")
+            let height = defaults.double(forKey: "secondaryFrameHeight")
+            let aspect = height > 0 ? width / height : cell.width / max(cell.height, 1)
+            secondaryCaptureFrame = CaptureGeometry.frame(width: width,
+                centeredAt: CGPoint(x: defaults.double(forKey: "secondaryFrameX"), y: defaults.double(forKey: "secondaryFrameY")),
+                within: frameBounds(for: target), aspectRatio: aspect, minimumWidth: 1)
+            let outputWidth = defaults.double(forKey: "secondaryOutputWidth")
+            let outputHeight = defaults.double(forKey: "secondaryOutputHeight")
+            if outputWidth > 0 && outputHeight > 0 {
+                secondaryOutputCell = CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
+            }
+        }
+        refitFrames(preserveHeight: false)
     }
 
     private func saveFramePosition() {
@@ -529,6 +729,20 @@ final class RecorderModel {
         defaults.set(Int(selectedDisplayID), forKey: "frameDisplayID")
         defaults.set(captureFrame.midX, forKey: "frameX")
         defaults.set(captureFrame.midY, forKey: "frameY")
+        defaults.set(captureFrame.width, forKey: "frameWidth")
+        defaults.set(layout.rawValue, forKey: "captureLayout")
+        defaults.set(splitRatio, forKey: "splitRatio")
+        if !secondaryCaptureFrame.isEmpty {
+            defaults.set(Int(selectedDisplayID), forKey: "secondaryFrameDisplayID")
+            defaults.set(secondaryCaptureFrame.width, forKey: "secondaryFrameWidth")
+            defaults.set(secondaryCaptureFrame.height, forKey: "secondaryFrameHeight")
+            defaults.set(secondaryCaptureFrame.midX, forKey: "secondaryFrameX")
+            defaults.set(secondaryCaptureFrame.midY, forKey: "secondaryFrameY")
+            if let cell = secondaryOutputCell {
+                defaults.set(cell.width, forKey: "secondaryOutputWidth")
+                defaults.set(cell.height, forKey: "secondaryOutputHeight")
+            }
+        }
     }
 
     private func restoreOutputFolder() {

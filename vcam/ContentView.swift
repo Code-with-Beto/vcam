@@ -13,7 +13,8 @@ struct ContentView: View {
             Divider()
             HStack(alignment: .top, spacing: 24) {
                 preview
-                settings
+                ScrollView { settings.padding(.trailing, 4) }
+                    .frame(height: 540)
             }
             .padding(24)
             Divider()
@@ -23,7 +24,8 @@ struct ContentView: View {
         .background(.background)
         .task { model.prepare(); syncDimensions(); model.commitFrameEdits = { commitDimensions() } }
         .onDisappear { model.commitFrameEdits = nil }
-        .onChange(of: model.captureFrame) { _, _ in syncDimensions() }
+        .onChange(of: model.activeCaptureFrame) { _, _ in syncDimensions(force: true) }
+        .onChange(of: model.selectedRegion) { _, _ in syncDimensions(force: true) }
         .onChange(of: dimensionFocus) { previous, _ in
             if previous == .width { applyWidth() }
             if previous == .height { applyHeight() }
@@ -75,19 +77,26 @@ struct ContentView: View {
                     VStack(spacing: 14) {
                         Image(systemName: "rectangle.portrait.dashed").font(.system(size: 38, weight: .ultraLight)).foregroundStyle(.secondary)
                         Text("Frame your next take").font(.headline)
-                        Text("Place the frame over any app.\nStart preview to see your shot.")
+                        Text("Place your frames over any app.\nStart preview to see your shot.")
                             .font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
-                        Button("Show frame") { model.showFrame() }.disabled(model.isBusy)
+                        Button(model.hasTwoRegions ? "Show frames" : "Show frame") { model.showFrame() }.disabled(model.isBusy)
                     }.padding(14)
                 }
             }
             .frame(width: 256, height: model.orientation == .portrait ? 455 : 256 * 9 / 16)
+            .overlay {
+                if model.isPreviewing {
+                    CompositionDivider(layout: model.layout,
+                        splitRatio: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
+                        isEnabled: !model.isBusy)
+                }
+            }
             .clipShape(RoundedRectangle(cornerRadius: 12))
             .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.primary.opacity(0.10)))
             .accessibilityElement(children: .contain)
             .accessibilityLabel(model.isPreviewing ? "Live video preview" : "Preview is off")
             Text(model.outputDimensions + " output pixels").font(.caption.monospacedDigit())
-            Text("Guides are only for you. The full frame is recorded.")
+            Text(model.hasTwoRegions ? "Both regions are saved in one video. Drag the preview divider to adjust the split, even while recording." : "Guides are only for you. The full frame is recorded.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.frame(width: 256)
     }
@@ -99,7 +108,7 @@ struct ContentView: View {
                 Picker("Display", selection: Binding(get: { model.selectedDisplayID }, set: { model.selectDisplay($0) })) {
                     ForEach(model.displays) { display in Text(display.name).tag(display.id) }
                 }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
-                SettingHelp("Display", "Choose the display to capture. The frame can move anywhere inside this display. Stop preview before switching displays.")
+                SettingHelp("Display", "Choose the display to capture. Both regions can move independently anywhere inside this display. Stop preview before switching displays.")
             }
             HStack {
                 Text("Orientation").frame(width: 90, alignment: .leading)
@@ -127,12 +136,23 @@ struct ContentView: View {
                 SettingHelp("Frame rate", "30 frames per second is the default for ordinary screen demos. 60 fps records smoother fast scrolling and motion, using more processing and storage. Preview is capped at 30 fps.")
             }
             Divider()
+            compositionSettings
+            Divider()
             VStack(alignment: .leading, spacing: 8) {
+                if model.hasTwoRegions {
+                    HStack {
+                        Text("Edit region").frame(width: 90, alignment: .leading)
+                        Picker("Edit region", selection: Binding(get: { model.selectedRegion }, set: { model.selectRegion($0) })) {
+                            ForEach(CaptureRegion.allCases) { Text(model.regionTitle($0)).tag($0) }
+                        }.labelsHidden().pickerStyle(.segmented).disabled(model.isBusy)
+                        SettingHelp("Edit region", "Blue A is the left or top view; orange B is the right or bottom view. Select a region to change its capture size, or drag its handle on screen to move it independently. Each handle has its own horizontal and vertical movement lock.")
+                    }
+                }
                 HStack {
-                    Text("Frame size").font(.callout.weight(.medium))
-                    SettingHelp("Frame size and points", "Points (pt) measure the frame's size on your Mac, not the saved video's resolution. On a 2× Retina display, 540 × 960 pt contains 1080 × 1920 source pixels. Width and height stay linked to the selected aspect ratio. Larger frames fit more content; smaller ones magnify it in the output.")
+                    Text(model.hasTwoRegions ? "\(model.regionTitle(model.selectedRegion)) size" : "Frame size").font(.callout.weight(.medium))
+                    SettingHelp("Frame size and points", "Points (pt) measure the region's size on your Mac, not the saved video's resolution. On a 2× Retina display, 540 × 960 pt contains 1080 × 1920 source pixels. Width and height stay linked to this region's part of the output, so content keeps its shape. Larger frames fit more content; smaller ones magnify it.")
                     Spacer()
-                    Text(model.orientation.ratioLabel + " linked").font(.caption).foregroundStyle(.secondary)
+                    Text(model.activeAspectLabel).font(.caption).foregroundStyle(.secondary)
                 }
                 HStack(spacing: 8) {
                     Text("W").foregroundStyle(.secondary)
@@ -144,12 +164,12 @@ struct ContentView: View {
                         .accessibilityLabel("Frame height in screen points")
                     Text("pt").foregroundStyle(.secondary)
                     Slider(value: Binding(get: { model.frameWidth }, set: { model.setFrameWidth($0) }),
-                           in: 180...max(180, model.maximumFrameWidth), step: 2)
+                           in: model.minimumFrameWidth...max(model.minimumFrameWidth, model.maximumFrameWidth), step: 2)
                         .accessibilityLabel("Recording frame size")
                 }.disabled(model.isRecording || model.isBusy)
                 HStack(spacing: 5) {
                     Image(systemName: model.isUpscaling ? "arrow.up.right" : "checkmark.circle")
-                    Text(model.sourceSizeText + (model.isUpscaling ? " · scaled up to output" : ""))
+                    Text(model.sourceSizeText + (model.isUpscaling ? " · scaled up to \(model.hasTwoRegions ? "panel" : "output")" : ""))
                 }.font(.caption).foregroundStyle(model.isUpscaling ? Color.orange : Color.secondary)
             }
             Divider()
@@ -205,6 +225,28 @@ struct ContentView: View {
         }.frame(maxWidth: .infinity, alignment: .leading).controlSize(.regular)
     }
 
+    private var compositionSettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Layout").frame(width: 90, alignment: .leading)
+                CompositionLayoutPicker(selection: Binding(get: { model.layout }, set: { model.setLayout($0) }),
+                    isEnabled: !model.isRecording && !model.isBusy)
+                SettingHelp("Layout", "Single records one region. Side by side places A on the left and B on the right. Stacked places A above B. Two movable frames capture separate parts of the same display into one video. Stop recording before changing layouts.")
+            }
+            if model.hasTwoRegions {
+                HStack {
+                    Text("Split").frame(width: 90, alignment: .leading)
+                    Slider(value: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }), in: 0.15...0.85)
+                        .accessibilityLabel("Region A share of output")
+                        .accessibilityValue(model.splitDescription)
+                    Text(model.splitDescription).font(.caption.monospacedDigit()).frame(width: 110)
+                    Button("50/50") { model.setSplitRatio(0.5) }
+                    SettingHelp("Split", "Give either region 15% to 85% of the output. Drag the divider in the live preview or use this slider, including during recording. Source frames resize around their centers to match, with no stretching. The divider and region labels are guides only and are not saved.")
+                }.disabled(model.isBusy)
+            }
+        }
+    }
+
     private var footer: some View {
         VStack(spacing: 10) {
             if let notice = model.notice {
@@ -218,7 +260,7 @@ struct ContentView: View {
                 }
             }
             HStack(spacing: 10) {
-                Button(model.isFrameVisible ? "Hide frame" : "Show frame") { model.toggleFrame() }.disabled(model.isRecording || model.isBusy)
+                Button(model.isFrameVisible ? (model.hasTwoRegions ? "Hide frames" : "Hide frame") : (model.hasTwoRegions ? "Show frames" : "Show frame")) { model.toggleFrame() }.disabled(model.isRecording || model.isBusy)
                 Text("⇧⌘F").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button(model.isPreviewing ? "Stop preview" : "Start preview") { Task { await model.togglePreview() } }
@@ -232,19 +274,17 @@ struct ContentView: View {
         }.padding(.horizontal, 24).padding(.vertical, 16)
     }
 
-    private func syncDimensions() {
-        if dimensionFocus != .width { widthText = dimensionString(model.captureFrame.width) }
-        if dimensionFocus != .height { heightText = dimensionString(model.captureFrame.height) }
+    private func syncDimensions(force: Bool = false) {
+        if force || dimensionFocus != .width { widthText = dimensionString(model.activeCaptureFrame.width) }
+        if force || dimensionFocus != .height { heightText = dimensionString(model.activeCaptureFrame.height) }
     }
     private func applyWidth() {
-        if widthText != dimensionString(model.captureFrame.width), let number = Double(widthText) { model.setFrameWidth(number) }
-        widthText = dimensionString(model.captureFrame.width)
-        heightText = dimensionString(model.captureFrame.height)
+        if widthText != dimensionString(model.activeCaptureFrame.width), let number = Double(widthText) { model.setFrameWidth(number) }
+        syncDimensions(force: true)
     }
     private func applyHeight() {
-        if heightText != dimensionString(model.captureFrame.height), let number = Double(heightText) { model.setFrameHeight(number) }
-        syncDimensions()
-        heightText = dimensionString(model.captureFrame.height)
+        if heightText != dimensionString(model.activeCaptureFrame.height), let number = Double(heightText) { model.setFrameHeight(number) }
+        syncDimensions(force: true)
     }
     private func commitDimensions() {
         if dimensionFocus == .width { applyWidth() }

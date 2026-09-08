@@ -10,6 +10,52 @@ struct CaptureConfiguration: Sendable {
     let showsCursor: Bool
     var outputSize = CGSize(width: 1080, height: 1920)
     var microphoneChannel: Int? = nil
+    var secondaryCaptureFrame: CGRect? = nil
+    var layout: CaptureLayout = .single
+    var splitRatio: Double = 0.5
+}
+
+enum CaptureLayout: String, CaseIterable, Identifiable, Sendable {
+    case single, sideBySide, stacked
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .single: return "Single region"
+        case .sideBySide: return "Side by side"
+        case .stacked: return "Stacked"
+        }
+    }
+
+    static func clampedSplitRatio(_ value: Double) -> Double {
+        value.isFinite ? min(max(value, 0.15), 0.85) : 0.5
+    }
+
+    /// Rectangles use Core Image's bottom-left origin. A is left/top and B is
+    /// right/bottom. Encoded output sizes are even; an even split boundary keeps
+    /// both cells aligned with the encoder's chroma grid, with no canvas gaps.
+    func destinationRects(in outputSize: CGSize, splitRatio: Double) -> [CGRect] {
+        let canvas = CGRect(origin: .zero, size: outputSize)
+        let ratio = CGFloat(Self.clampedSplitRatio(splitRatio))
+        switch self {
+        case .single:
+            return [canvas]
+        case .sideBySide:
+            let width = min(max((outputSize.width * ratio / 2).rounded() * 2, 2), outputSize.width - 2)
+            return [CGRect(x: 0, y: 0, width: width, height: outputSize.height),
+                    CGRect(x: width, y: 0, width: outputSize.width - width, height: outputSize.height)]
+        case .stacked:
+            let height = min(max((outputSize.height * ratio / 2).rounded() * 2, 2), outputSize.height - 2)
+            return [CGRect(x: 0, y: outputSize.height - height, width: outputSize.width, height: height),
+                    CGRect(x: 0, y: 0, width: outputSize.width, height: outputSize.height - height)]
+        }
+    }
+}
+
+struct CaptureComposition: Sendable {
+    var layout: CaptureLayout = .single
+    var splitRatio: Double = 0.5
+    var primaryFrame: CGRect
+    var secondaryFrame: CGRect?
 }
 
 enum CaptureOrientation: String, CaseIterable, Identifiable, Sendable {
@@ -37,8 +83,10 @@ enum CaptureGeometry {
     static let outputSize = CGSize(width: 1080, height: 1920)
 
     static func frame(width: CGFloat, centeredAt center: CGPoint, within bounds: CGRect,
-                      aspectRatio: CGFloat = CaptureGeometry.aspectRatio) -> CGRect {
-        let fittedWidth = min(max(width, 144), bounds.width, bounds.height * aspectRatio)
+                      aspectRatio: CGFloat = CaptureGeometry.aspectRatio,
+                      minimumWidth: CGFloat = 144) -> CGRect {
+        let validMinimum = minimumWidth.isFinite && minimumWidth > 0 ? minimumWidth : 144
+        let fittedWidth = min(max(width, validMinimum), bounds.width, bounds.height * aspectRatio)
         let size = CGSize(width: fittedWidth, height: fittedWidth / aspectRatio)
         return clamp(CGRect(x: center.x - size.width / 2, y: center.y - size.height / 2,
                             width: size.width, height: size.height), to: bounds)

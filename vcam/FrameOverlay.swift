@@ -7,6 +7,11 @@ final class FrameOverlayController {
     var onToggleRecording: (() -> Void)?
     var onHide: (() -> Void)?
     var onMotionModeChanged: ((String) -> Void)?
+    var onSelect: (() -> Void)?
+
+    private static let displayedOverlays = NSHashTable<FrameOverlayController>.weakObjects()
+    private static var nextPlacementOrder = 0
+    private let placementOrder: Int
 
     private let guideView = CaptureGuideView()
     private let handleView = CaptureHandleView()
@@ -20,6 +25,8 @@ final class FrameOverlayController {
     private var motionMode = FrameMotionMode.free
 
     init() {
+        placementOrder = Self.nextPlacementOrder
+        Self.nextPlacementOrder += 1
         guideWindow = CaptureOverlayPanel(contentRect: .zero)
         handleWindow = CaptureOverlayPanel(
             contentRect: CGRect(origin: .zero, size: CaptureHandleView.preferredSize)
@@ -35,6 +42,7 @@ final class FrameOverlayController {
 
         handleView.onDragBegan = { [weak self] point in
             guard let self else { return }
+            self.onSelect?()
             self.dragStartPoint = point
             self.dragStartFrame = self.frame
         }
@@ -67,31 +75,53 @@ final class FrameOverlayController {
         }
     }
 
-    func show(frame: CGRect, displayFrame: CGRect, guides: Bool, guideBottomInset: CGFloat = 0.08) {
+    func show(frame: CGRect, displayFrame: CGRect, guides: Bool, guideBottomInset: CGFloat = 0.08,
+              label: String? = nil, accent: NSColor = .systemCyan, isSelected: Bool = true) {
+        Self.displayedOverlays.add(self)
         update(frame: frame, displayFrame: displayFrame, guides: guides,
-               recording: recording, guideBottomInset: guideBottomInset)
+               recording: recording, guideBottomInset: guideBottomInset,
+               label: label, accent: accent, isSelected: isSelected)
         // This leaves the user's terminal, browser, or other app focused.
         guideWindow.orderFrontRegardless()
         handleWindow.orderFrontRegardless()
+        positionWindows()
     }
 
     func update(frame: CGRect, displayFrame: CGRect, guides: Bool, recording: Bool,
-                guideBottomInset: CGFloat = 0.08) {
+                guideBottomInset: CGFloat = 0.08, label: String? = nil,
+                accent: NSColor = .systemCyan, isSelected: Bool = true) {
+        let becameSelected = isSelected && !handleView.isSelected
         self.frame = frame
         self.displayFrame = displayFrame
         self.recording = recording
         guideView.showsGuides = guides
         guideView.isRecording = recording
         guideView.bottomInset = SafeAreaGuide.normalizedBottomInset(guideBottomInset)
+        guideView.identityLabel = label
+        guideView.accent = accent
+        guideView.isSelected = isSelected
         handleView.isRecording = recording
         handleView.aspectLabel = SafeAreaGuide.aspectLabel(for: frame.size)
-        guideWindow.setAccessibilityLabel("\(handleView.aspectLabel) recording frame")
+        handleView.identityLabel = label
+        handleView.accent = accent
+        handleView.isSelected = isSelected
+        let identity = label ?? handleView.aspectLabel
+        guideWindow.setAccessibilityLabel("\(identity) recording frame")
+        handleWindow.setAccessibilityLabel("\(identity) recording controls")
         positionWindows()
+        if becameSelected && handleWindow.isVisible {
+            guideWindow.orderFrontRegardless()
+            handleWindow.orderFrontRegardless()
+        }
     }
 
     func hide() {
+        Self.displayedOverlays.remove(self)
         guideWindow.orderOut(nil)
         handleWindow.orderOut(nil)
+        for overlay in Self.displayedOverlays.allObjects.sorted(by: { $0.placementOrder < $1.placementOrder }) {
+            overlay.positionHandleWindow()
+        }
     }
 
     private func clamped(_ proposed: CGRect) -> CGRect {
@@ -109,8 +139,18 @@ final class FrameOverlayController {
 
     private func positionWindows() {
         guideWindow.setFrame(frame, display: true)
+        positionHandleWindow()
+        // Earlier-created regions keep their anchor. Later handles move around them,
+        // avoiding the oscillation caused by each handle trying to dodge the other.
+        for overlay in Self.displayedOverlays.allObjects.sorted(by: { $0.placementOrder < $1.placementOrder })
+            where overlay.placementOrder > placementOrder && overlay.handleWindow.isVisible {
+            overlay.positionHandleWindow()
+        }
+        guideView.needsDisplay = true
+    }
 
-        let size = CaptureHandleView.preferredSize
+    private func positionHandleWindow() {
+        let size = handleView.preferredSize
         let gap: CGFloat = 9
         let aboveY = frame.maxY + gap
         let belowY = frame.minY - size.height - gap
@@ -131,8 +171,23 @@ final class FrameOverlayController {
             max(proposedY, displayFrame.minY + 4),
             max(displayFrame.minY + 4, displayFrame.maxY - size.height - 4)
         )
-        handleWindow.setFrame(CGRect(x: x, y: y, width: size.width, height: size.height), display: true)
-        guideView.needsDisplay = true
+        let anchor = CGRect(x: x, y: y, width: size.width, height: size.height)
+        let obstacles = Self.displayedOverlays.allObjects.filter {
+            $0.placementOrder < placementOrder && $0.handleWindow.isVisible
+        }.map { $0.handleWindow.frame.insetBy(dx: -4, dy: -4) }
+        var candidates = [anchor]
+        for candidateY in [belowY, aboveY, frame.maxY - size.height - gap, frame.minY + gap] {
+            candidates.append(CGRect(x: x, y: candidateY, width: size.width, height: size.height))
+        }
+        for step in 1...6 {
+            for direction: CGFloat in [-1, 1] {
+                candidates.append(anchor.offsetBy(dx: 0, dy: direction * CGFloat(step) * (size.height + gap)))
+            }
+        }
+        let usableDisplay = displayFrame.insetBy(dx: 4, dy: 4)
+        let reachable = candidates.filter { usableDisplay.contains($0) }
+        let target = reachable.first { candidate in !obstacles.contains { $0.intersects(candidate) } } ?? anchor
+        handleWindow.setFrame(target, display: true)
     }
 }
 
@@ -165,20 +220,27 @@ private final class CaptureGuideView: NSView {
     var showsGuides = true { didSet { needsDisplay = true } }
     var isRecording = false { didSet { needsDisplay = true } }
     var bottomInset: CGFloat = SafeAreaGuide.edgeInset { didSet { needsDisplay = true } }
+    var identityLabel: String? { didSet { needsDisplay = true } }
+    var accent: NSColor = .systemCyan { didSet { needsDisplay = true } }
+    var isSelected = true { didSet { needsDisplay = true } }
 
     override var isOpaque: Bool { false }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard bounds.width > 0, bounds.height > 0 else { return }
-        let tint: NSColor = isRecording ? .systemRed : .systemCyan
+        let tint: NSColor = isRecording && identityLabel == nil ? .systemRed : accent
         let border = NSBezierPath(rect: bounds.insetBy(dx: 2, dy: 2))
         NSColor.black.withAlphaComponent(0.6).setStroke()
         border.lineWidth = 4
         border.stroke()
-        tint.setStroke()
-        border.lineWidth = 2
+        tint.withAlphaComponent(isSelected ? 1 : 0.65).setStroke()
+        border.lineWidth = isSelected ? 2.5 : 1.5
         border.stroke()
+
+        if let identityLabel {
+            drawPill(identityLabel, at: CGPoint(x: 10, y: max(4, bounds.height - 29)), tint: accent)
+        }
 
         guard showsGuides else { return }
 
@@ -231,7 +293,7 @@ private final class CaptureGuideView: NSView {
 
         // Small landscape frames can have margins shorter than a readable label.
         // The handle still identifies the aspect ratio without covering the content.
-        if bounds.height - safeRect.maxY >= 23 {
+        if identityLabel == nil && bounds.height - safeRect.maxY >= 23 {
             let topLabel = "\(SafeAreaGuide.aspectLabel(for: bounds.size)) · Padding guide"
             drawCenteredPill(topLabel, y: safeRect.maxY + (bounds.height - safeRect.maxY - 20) / 2, tint: .white)
         }
@@ -273,6 +335,7 @@ private enum FrameMotionMode: String {
 @MainActor
 private final class CaptureHandleView: NSView {
     static let preferredSize = CGSize(width: 330, height: 40)
+    var preferredSize: CGSize { CGSize(width: Self.preferredSize.width + dragRegionWidth - 76, height: 40) }
     var onDragBegan: ((CGPoint) -> Void)?
     var onDragMoved: ((CGPoint) -> Void)?
     var onToggleRecording: (() -> Void)?
@@ -286,6 +349,26 @@ private final class CaptureHandleView: NSView {
     private let verticalButton = OverlayButton(title: "", target: nil, action: nil)
     private var motionMode = FrameMotionMode.free
     var aspectLabel = "9:16" { didSet { needsDisplay = true } }
+    var identityLabel: String? {
+        didSet {
+            needsLayout = true
+            needsDisplay = true
+            window?.invalidateCursorRects(for: self)
+            updateIdentityAppearance()
+        }
+    }
+    var accent: NSColor = .systemCyan {
+        didSet {
+            updateIdentityAppearance()
+            updateMotionButtons()
+        }
+    }
+    var isSelected = true { didSet { updateIdentityAppearance() } }
+    private var dragRegionWidth: CGFloat {
+        guard let identityLabel else { return 76 }
+        let width = (identityLabel as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: 11, weight: .semibold)]).width
+        return max(76, min(122, ceil(width) + 44))
+    }
     var isRecording = false {
         didSet {
             updateButtons()
@@ -340,11 +423,12 @@ private final class CaptureHandleView: NSView {
 
     override func layout() {
         super.layout()
-        freeButton.frame = CGRect(x: 84, y: 6, width: 38, height: 28)
-        horizontalButton.frame = CGRect(x: 128, y: 6, width: 28, height: 28)
-        verticalButton.frame = CGRect(x: 162, y: 6, width: 28, height: 28)
-        recordingButton.frame = CGRect(x: 200, y: 6, width: 86, height: 28)
-        hideButton.frame = CGRect(x: 297, y: 6, width: 26, height: 28)
+        let offset = dragRegionWidth - 76
+        freeButton.frame = CGRect(x: 84 + offset, y: 6, width: 38, height: 28)
+        horizontalButton.frame = CGRect(x: 128 + offset, y: 6, width: 28, height: 28)
+        verticalButton.frame = CGRect(x: 162 + offset, y: 6, width: 28, height: 28)
+        recordingButton.frame = CGRect(x: 200 + offset, y: 6, width: 86, height: 28)
+        hideButton.frame = CGRect(x: 297 + offset, y: 6, width: 26, height: 28)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -356,19 +440,26 @@ private final class CaptureHandleView: NSView {
                 NSBezierPath(ovalIn: CGRect(x: x, y: y - 1, width: 2, height: 2)).fill()
             }
         }
-        (aspectLabel as NSString).draw(
-            at: CGPoint(x: 31, y: 13),
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingTail
+        ((identityLabel ?? aspectLabel) as NSString).draw(
+            in: CGRect(x: 31, y: 12, width: dragRegionWidth - 42, height: 17),
             withAttributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-                .foregroundColor: NSColor.white.withAlphaComponent(0.9)
+                .font: NSFont.systemFont(ofSize: identityLabel == nil ? 12 : 11, weight: .semibold),
+                .foregroundColor: identityLabel == nil ? NSColor.white.withAlphaComponent(0.9) : accent,
+                .paragraphStyle: paragraph
             ]
         )
+        if isRecording {
+            NSColor.systemRed.setFill()
+            NSBezierPath(ovalIn: CGRect(x: dragRegionWidth - 9, y: 18, width: 5, height: 5)).fill()
+        }
         NSColor.white.withAlphaComponent(0.12).setFill()
-        NSBezierPath(rect: CGRect(x: 76, y: 11, width: 1, height: 18)).fill()
+        NSBezierPath(rect: CGRect(x: dragRegionWidth, y: 11, width: 1, height: 18)).fill()
     }
 
     override func resetCursorRects() {
-        addCursorRect(CGRect(x: 0, y: 0, width: 76, height: bounds.height), cursor: .openHand)
+        addCursorRect(CGRect(x: 0, y: 0, width: dragRegionWidth, height: bounds.height), cursor: .openHand)
     }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
@@ -421,12 +512,19 @@ private final class CaptureHandleView: NSView {
         for (button, mode) in [(freeButton, FrameMotionMode.free), (horizontalButton, .horizontal), (verticalButton, .vertical)] {
             let selected = mode == motionMode
             button.state = selected ? .on : .off
-            button.contentTintColor = selected ? .systemCyan : .white.withAlphaComponent(0.7)
+            button.contentTintColor = selected ? accent : .white.withAlphaComponent(0.7)
             button.layer?.backgroundColor = selected
-                ? NSColor.systemCyan.withAlphaComponent(0.16).cgColor
+                ? accent.withAlphaComponent(0.16).cgColor
                 : NSColor.clear.cgColor
             button.setAccessibilityValue(selected ? "Selected" : "Not selected")
         }
+    }
+
+    private func updateIdentityAppearance() {
+        layer?.borderWidth = isSelected ? 1.5 : 1
+        layer?.borderColor = accent.withAlphaComponent(isSelected ? 0.65 : 0.22).cgColor
+        setAccessibilityLabel("\(identityLabel ?? aspectLabel) recording frame controls\(isSelected ? ", selected" : "")")
+        needsDisplay = true
     }
 
     @objc private func moveFreely() { setMotionMode(.free) }

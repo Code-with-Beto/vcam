@@ -142,6 +142,11 @@ final class CaptureEngine {
 
     func updateCrop(_ frame: CGRect) { worker?.updateCrop(frame) }
 
+    func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double) {
+        worker?.updateComposition(primaryFrame: primaryFrame, secondaryFrame: secondaryFrame,
+                                  layout: layout, splitRatio: splitRatio)
+    }
+
     func startRecording(to url: URL) async throws {
         guard let worker, stream != nil, !isStarting else {
             throw CaptureError.message("Open the camera before recording.")
@@ -203,7 +208,11 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     private var latchedMicrophoneChannel: Int?
     private var microphoneSampleRate: Double?
     private var microphonePeak: Float = 0
-    private var cropFrame: CGRect
+    private var composition: CaptureComposition
+    private var cropFrame: CGRect {
+        get { composition.primaryFrame }
+        set { composition.primaryFrame = newValue }
+    }
     private weak var expectedStream: SCStream?
     private var active = false
     private var timer: DispatchSourceTimer?
@@ -235,7 +244,9 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
 
     init(configuration: CaptureConfiguration) {
         self.configuration = configuration
-        cropFrame = configuration.captureFrame
+        composition = CaptureComposition(layout: configuration.layout,
+            splitRatio: CaptureLayout.clampedSplitRatio(configuration.splitRatio),
+            primaryFrame: configuration.captureFrame, secondaryFrame: configuration.secondaryCaptureFrame)
         outputRect = CGRect(origin: .zero, size: configuration.outputSize)
         let previewScale = min(1, 960 / max(configuration.outputSize.width, configuration.outputSize.height))
         previewRect = CGRect(x: 0, y: 0,
@@ -303,6 +314,21 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         queue.async {
             guard frame.width > 0, frame.height > 0, frame.minX.isFinite, frame.minY.isFinite else { return }
             self.cropFrame = frame
+        }
+    }
+
+    func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double) {
+        queue.async {
+            func valid(_ frame: CGRect) -> Bool {
+                frame.width.isFinite && frame.height.isFinite && frame.minX.isFinite && frame.minY.isFinite &&
+                    frame.width > 0 && frame.height > 0
+            }
+            guard valid(primaryFrame), secondaryFrame.map(valid) ?? true else { return }
+            // One serial-queue assignment keeps the two source frames and their
+            // destination geometry from being mixed across separate UI updates.
+            self.composition = CaptureComposition(layout: layout,
+                splitRatio: CaptureLayout.clampedSplitRatio(splitRatio),
+                primaryFrame: primaryFrame, secondaryFrame: secondaryFrame)
         }
     }
 
@@ -541,18 +567,44 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     }
 
     private func croppedImage(from buffer: CVPixelBuffer) -> CIImage {
-        // SCStreamConfiguration requests sRGB. State that contract explicitly
-        // instead of relying on Core Image's fallback for untagged RGB buffers.
+        // Both regions sample the same cached display frame. Moving a region or
+        // the split never reconfigures capture, timestamps, or the output file.
         let source = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: CaptureColor.space])
-        // Both AppKit's global frame and Core Image use a bottom-left origin. Remove
-        // the selected display's global origin, then convert points to captured pixels.
-        // No Quartz top-left conversion is needed because we capture the full display.
-        let crop = CaptureGeometry.sourcePixelCrop(cropFrame,
+        let state = composition
+        let destinations = state.layout.destinationRects(in: outputRect.size, splitRatio: state.splitRatio)
+        var result = CIImage(color: .black).cropped(to: outputRect)
+        result = regionImage(source, frame: state.primaryFrame, destination: destinations[0]).composited(over: result)
+        if destinations.count > 1, let secondary = state.secondaryFrame {
+            result = regionImage(source, frame: secondary, destination: destinations[1]).composited(over: result)
+        }
+        return result.cropped(to: outputRect)
+    }
+
+    private func regionImage(_ source: CIImage, frame: CGRect, destination: CGRect) -> CIImage {
+        var crop = CaptureGeometry.sourcePixelCrop(frame,
             displayFrame: configuration.displayFrame, pixelSize: source.extent.size)
-        let positioned = source.cropped(to: crop)
+        let destinationAspect = destination.width / destination.height
+        let sourceAspect = crop.width / crop.height
+        // UI frames follow their destination aspect. If an update or restored
+        // frame differs, center-crop before a uniform scale instead of stretching.
+        if abs(sourceAspect - destinationAspect) > 0.000_001 {
+            let original = crop
+            if sourceAspect > destinationAspect {
+                crop.size.width = crop.height * destinationAspect
+            } else {
+                crop.size.height = crop.width / destinationAspect
+            }
+            let maximumX = max(original.minX, floor(original.maxX - crop.width))
+            let maximumY = max(original.minY, floor(original.maxY - crop.height))
+            crop.origin.x = min(max((original.midX - crop.width / 2).rounded(), original.minX), maximumX)
+            crop.origin.y = min(max((original.midY - crop.height / 2).rounded(), original.minY), maximumY)
+        }
+        let scale = destination.width / crop.width
+        return source.cropped(to: crop)
             .transformed(by: CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
-            .transformed(by: CGAffineTransform(scaleX: outputRect.width / crop.width, y: outputRect.height / crop.height))
-        return positioned.composited(over: CIImage(color: .black).cropped(to: outputRect)).cropped(to: outputRect)
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            .transformed(by: CGAffineTransform(translationX: destination.minX, y: destination.minY))
+            .cropped(to: destination)
     }
 
     private func renderTick() {
@@ -785,6 +837,84 @@ extension CaptureWorker {
             }
             await worker.shutdown()
             return result
+        } catch {
+            await worker.shutdown()
+            throw error
+        }
+    }
+
+    /// Records several composition states against one unchanged source buffer.
+    /// Returned times are phase midpoints on the encoded movie's timeline.
+    static func recordCompositionFixture(_ buffer: CVPixelBuffer, displayFrame: CGRect,
+                                         phases: [CaptureComposition], to url: URL,
+                                         outputSize: CGSize) async throws -> (url: URL, sampleTimes: [Double]) {
+        guard let initial = phases.first else { throw CaptureError.message("The composition fixture needs an initial phase.") }
+        var config = CaptureConfiguration(displayID: CGMainDisplayID(), displayFrame: displayFrame,
+            captureFrame: initial.primaryFrame, framesPerSecond: 30,
+            microphoneID: "synthetic-microphone", showsCursor: false)
+        config.outputSize = outputSize
+        config.secondaryCaptureFrame = initial.secondaryFrame
+        config.layout = initial.layout
+        config.splitRatio = initial.splitRatio
+        let worker = CaptureWorker(configuration: config)
+        let frame = SyntheticFrame(buffer)
+        let audio = SyntheticAudioState()
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            worker.queue.async {
+                worker.active = true
+                worker.startedAt = CACurrentMediaTime()
+                worker.captureClock = CMClockGetHostTimeClock()
+                worker.latestBuffer = frame.buffer
+                do {
+                    let time = CMClockGetTime(CMClockGetHostTimeClock())
+                    worker.processMicrophone(try syntheticMicrophoneSample(count: 512, offset: 0,
+                        at: time, competingInput: false), at: time)
+                    continuation.resume()
+                } catch { continuation.resume(throwing: error) }
+            }
+        }
+        do {
+            await worker.beginRendering(clock: CMClockGetHostTimeClock())
+            try await worker.startRecording(to: url)
+            var times: [Double] = []
+            for phase in phases {
+                worker.updateComposition(primaryFrame: phase.primaryFrame, secondaryFrame: phase.secondaryFrame,
+                    layout: phase.layout, splitRatio: phase.splitRatio)
+                let phaseStart: Double = await withCheckedContinuation { continuation in
+                    worker.queue.async {
+                        continuation.resume(returning: CMTimeSubtract(worker.captureTime()!, worker.firstVideoTime!).seconds)
+                    }
+                }
+                for _ in 0..<12 {
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        worker.queue.async {
+                            let first = worker.firstVideoTime!
+                            let elapsed = CMTimeSubtract(worker.captureTime()!, first).seconds
+                            let count = max(1, Int(elapsed * 48_000) - audio.sampleCount)
+                            do {
+                                let time = CMTimeAdd(first, CMTime(value: Int64(audio.sampleCount), timescale: 48_000))
+                                let sample = try syntheticMicrophoneSample(count: count, offset: audio.sampleCount,
+                                    at: time, competingInput: false)
+                                audio.sampleCount += count
+                                worker.processMicrophone(sample, at: time)
+                                continuation.resume()
+                            } catch { continuation.resume(throwing: error) }
+                        }
+                    }
+                    try await Task.sleep(for: .milliseconds(33))
+                }
+                let phaseEnd: Double = await withCheckedContinuation { continuation in
+                    worker.queue.async {
+                        continuation.resume(returning: CMTimeSubtract(worker.captureTime()!, worker.firstVideoTime!).seconds)
+                    }
+                }
+                times.append((phaseStart + phaseEnd) / 2)
+            }
+            guard let result = try await worker.stopRecording() else {
+                throw CaptureError.message("The composition fixture did not save a recording.")
+            }
+            await worker.shutdown()
+            return (result, times)
         } catch {
             await worker.shutdown()
             throw error
