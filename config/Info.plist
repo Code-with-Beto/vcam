@@ -4,5 +4,9 @@
 <dict>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Preview and record the screen area inside your vertical frame.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Add your camera as a layout region or a movable overlay in your screen recordings.</string>
+    <key>NSCameraUseContinuityCameraDeviceType</key>
+    <true/>
 </dict>
 </plist>

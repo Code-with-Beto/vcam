@@ -1,7 +1,7 @@
 // Run from the project root (uses generated pixels only; no screen or microphone access):
 // xcrun swiftc -D VCAM_CAPTURE_VALIDATION -swift-version 5 -target arm64-apple-macos15.0 \
 //   vcam/CaptureTypes.swift vcam/CapturePCM.swift vcam/CaptureMicrophone.swift \
-//   vcam/CaptureEngine.swift scripts/validate-color.swift -o /tmp/vcam-validate-color
+//   vcam/CaptureCamera.swift vcam/CaptureEngine.swift scripts/validate-color.swift -o /tmp/vcam-validate-color
 // /tmp/vcam-validate-color [1080|1440]
 //
 // Measures actual production preview buffers and H.264 decoded pixels in the same

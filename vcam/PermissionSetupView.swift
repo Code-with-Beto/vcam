@@ -36,6 +36,20 @@ struct PermissionSetupView: View {
                     model.refreshPermissions()
                 }.buttonStyle(.link)
             }
+            if model.cameraPlacement != .off {
+                Divider()
+                permissionRow(
+                    title: "Camera",
+                    detail: "Adds your selected camera to the video. Your microphone setting stays independent.",
+                    granted: model.cameraAuthorization == .authorized,
+                    button: model.cameraAuthorization == .notDetermined ? "Enable camera" : "Open Settings"
+                ) { Task { await model.requestCameraAccess() } }
+                .disabled(model.requestingCamera)
+                if model.cameraAuthorization != .authorized {
+                    Button("Continue without a camera") { Task { await model.setCameraPlacement(.off) } }
+                        .buttonStyle(.link).disabled(model.isBusy)
+                }
+            }
             if model.requestedScreenAccess && !model.screenAccessGranted {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("If access is enabled but still not detected", systemImage: "arrow.clockwise")

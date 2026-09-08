@@ -89,6 +89,11 @@ struct ContentView: View {
                     CompositionDivider(layout: model.layout,
                         splitRatio: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
                         isEnabled: !model.isBusy)
+                    if model.cameraPlacement == .overlay {
+                        CameraOverlayControls(
+                            configuration: Binding(get: { model.cameraOverlay }, set: { model.setCameraOverlay($0) }),
+                            outputSize: model.outputSize, isEnabled: !model.isBusy)
+                    }
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -96,7 +101,9 @@ struct ContentView: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel(model.isPreviewing ? "Live video preview" : "Preview is off")
             Text(model.outputDimensions + " output pixels").font(.caption.monospacedDigit())
-            Text(model.hasTwoRegions ? "Both regions are saved in one video. Drag the preview divider to adjust the split, even while recording." : "Guides are only for you. The full frame is recorded.")
+            Text(model.cameraPlacement == .overlay
+                 ? "Drag your camera to move it, or drag its corner to resize. Placement changes are recorded."
+                 : model.hasTwoRegions ? "Both regions are saved in one video. Drag the preview divider to adjust the split, even while recording." : "Guides are only for you. The full frame is recorded.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }.frame(width: 256)
     }
@@ -138,6 +145,8 @@ struct ContentView: View {
             Divider()
             compositionSettings
             Divider()
+            CameraSettingsView(model: model)
+            Divider()
             VStack(alignment: .leading, spacing: 8) {
                 if model.hasTwoRegions {
                     HStack {
@@ -148,29 +157,36 @@ struct ContentView: View {
                         SettingHelp("Edit region", "Blue A is the left or top view; orange B is the right or bottom view. Select a region to change its capture size, or drag its handle on screen to move it independently. Each handle has its own horizontal and vertical movement lock.")
                     }
                 }
-                HStack {
-                    Text(model.hasTwoRegions ? "\(model.regionTitle(model.selectedRegion)) size" : "Frame size").font(.callout.weight(.medium))
-                    SettingHelp("Frame size and points", "Points (pt) measure the region's size on your Mac, not the saved video's resolution. On a 2× Retina display, 540 × 960 pt contains 1080 × 1920 source pixels. Width and height stay linked to this region's part of the output, so content keeps its shape. Larger frames fit more content; smaller ones magnify it.")
-                    Spacer()
-                    Text(model.activeAspectLabel).font(.caption).foregroundStyle(.secondary)
+                if model.activeRegionIsCamera {
+                    Label("Camera fills \(model.regionTitle(model.selectedRegion))", systemImage: "video.fill")
+                        .font(.callout.weight(.medium))
+                    Text("Use the split to resize this panel. The camera is cropped to fill without stretching.")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    HStack {
+                        Text(model.hasTwoRegions ? "\(model.regionTitle(model.selectedRegion)) size" : "Frame size").font(.callout.weight(.medium))
+                        SettingHelp("Frame size and points", "Points (pt) measure the region's size on your Mac, not the saved video's resolution. On a 2× Retina display, 540 × 960 pt contains 1080 × 1920 source pixels. Width and height stay linked to this region's part of the output, so content keeps its shape. Larger frames fit more content; smaller ones magnify it.")
+                        Spacer()
+                        Text(model.activeAspectLabel).font(.caption).foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 8) {
+                        Text("W").foregroundStyle(.secondary)
+                        TextField("Width", text: $widthText).frame(width: 74).focused($dimensionFocus, equals: .width).onSubmit { applyWidth() }
+                            .accessibilityLabel("Frame width in screen points")
+                        Text("×").foregroundStyle(.secondary)
+                        Text("H").foregroundStyle(.secondary)
+                        TextField("Height", text: $heightText).frame(width: 74).focused($dimensionFocus, equals: .height).onSubmit { applyHeight() }
+                            .accessibilityLabel("Frame height in screen points")
+                        Text("pt").foregroundStyle(.secondary)
+                        Slider(value: Binding(get: { model.frameWidth }, set: { model.setFrameWidth($0) }),
+                               in: model.minimumFrameWidth...max(model.minimumFrameWidth, model.maximumFrameWidth), step: 2)
+                            .accessibilityLabel("Recording frame size")
+                    }.disabled(model.isRecording || model.isBusy)
+                    HStack(spacing: 5) {
+                        Image(systemName: model.isUpscaling ? "arrow.up.right" : "checkmark.circle")
+                        Text(model.sourceSizeText + (model.isUpscaling ? " · scaled up to \(model.hasTwoRegions ? "panel" : "output")" : ""))
+                    }.font(.caption).foregroundStyle(model.isUpscaling ? Color.orange : Color.secondary)
                 }
-                HStack(spacing: 8) {
-                    Text("W").foregroundStyle(.secondary)
-                    TextField("Width", text: $widthText).frame(width: 74).focused($dimensionFocus, equals: .width).onSubmit { applyWidth() }
-                        .accessibilityLabel("Frame width in screen points")
-                    Text("×").foregroundStyle(.secondary)
-                    Text("H").foregroundStyle(.secondary)
-                    TextField("Height", text: $heightText).frame(width: 74).focused($dimensionFocus, equals: .height).onSubmit { applyHeight() }
-                        .accessibilityLabel("Frame height in screen points")
-                    Text("pt").foregroundStyle(.secondary)
-                    Slider(value: Binding(get: { model.frameWidth }, set: { model.setFrameWidth($0) }),
-                           in: model.minimumFrameWidth...max(model.minimumFrameWidth, model.maximumFrameWidth), step: 2)
-                        .accessibilityLabel("Recording frame size")
-                }.disabled(model.isRecording || model.isBusy)
-                HStack(spacing: 5) {
-                    Image(systemName: model.isUpscaling ? "arrow.up.right" : "checkmark.circle")
-                    Text(model.sourceSizeText + (model.isUpscaling ? " · scaled up to \(model.hasTwoRegions ? "panel" : "output")" : ""))
-                }.font(.caption).foregroundStyle(model.isUpscaling ? Color.orange : Color.secondary)
             }
             Divider()
             HStack {

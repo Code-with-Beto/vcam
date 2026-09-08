@@ -2,7 +2,7 @@
 // DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun swiftc \
 //   -D VCAM_CAPTURE_VALIDATION -swift-version 5 -target arm64-apple-macos15.0 \
 //   vcam/CaptureTypes.swift vcam/CapturePCM.swift vcam/CaptureMicrophone.swift \
-//   vcam/CaptureEngine.swift scripts/validate-composition.swift -o /tmp/vcam-validate-composition
+//   vcam/CaptureCamera.swift vcam/CaptureEngine.swift scripts/validate-composition.swift -o /tmp/vcam-validate-composition
 // /tmp/vcam-validate-composition [width height] (defaults: 1440 2560)
 import AVFoundation
 import CoreImage

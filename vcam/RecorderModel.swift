@@ -18,6 +18,11 @@ struct MicrophoneChoice: Identifiable {
     let channels: Int
 }
 
+struct CameraChoice: Identifiable {
+    let id: String
+    let name: String
+}
+
 enum CaptureRegion: String, CaseIterable, Identifiable {
     case primary, secondary
     var id: String { rawValue }
@@ -28,6 +33,13 @@ enum CaptureRegion: String, CaseIterable, Identifiable {
 final class RecorderModel {
     var displays: [DisplayChoice] = []
     var microphones: [MicrophoneChoice] = []
+    private(set) var cameras: [CameraChoice] = []
+    private(set) var selectedCameraID: String = ""
+    private(set) var cameraPlacement: CameraPlacement = .off
+    private(set) var cameraOverlay = CameraOverlayConfiguration()
+    private(set) var mirrorsCamera = true
+    private(set) var cameraAuthorization = AVAuthorizationStatus.notDetermined
+    private(set) var requestingCamera = false
     var selectedDisplayID: CGDirectDisplayID = 0
     var selectedMicrophoneID: String {
         didSet { UserDefaults.standard.set(selectedMicrophoneID, forKey: "microphoneID") }
@@ -136,6 +148,16 @@ final class RecorderModel {
         resolution = OutputResolution(rawValue: defaults.integer(forKey: "resolution")) ?? .qhd
         reservesCaptions = defaults.bool(forKey: "reservesCaptions")
         microphoneChannel = defaults.object(forKey: "microphoneChannel") as? Int ?? -1
+        selectedCameraID = defaults.string(forKey: "cameraID") ?? ""
+        cameraPlacement = CameraPlacement(rawValue: defaults.string(forKey: "cameraPlacement") ?? "") ?? .off
+        if layout == .single && (cameraPlacement == .regionA || cameraPlacement == .regionB) { cameraPlacement = .overlay }
+        mirrorsCamera = defaults.object(forKey: "mirrorsCamera") as? Bool ?? true
+        cameraOverlay = CameraOverlayConfiguration(
+            center: CGPoint(x: defaults.object(forKey: "cameraCenterX") as? Double ?? 0.78,
+                            y: defaults.object(forKey: "cameraCenterY") as? Double ?? 0.20),
+            widthFraction: defaults.object(forKey: "cameraWidthFraction") as? Double ?? 0.30,
+            shape: CameraShape(rawValue: defaults.string(forKey: "cameraShape") ?? "") ?? .circle)
+        cameraOverlay = cameraOverlay.clamped(in: outputSize)
         restoreOutputFolder()
         engine.onPreviewPixelBuffer = { [weak self] buffer in self?.previewSurface.display(buffer) }
         engine.onAudioDecibels = { [weak self] level in self?.audioDecibels = level }
@@ -174,7 +196,19 @@ final class RecorderModel {
     var guideBottomInset: CGFloat { reservesCaptions ? 0.20 : 0.08 }
     var microphoneChannels: Int { microphones.first { $0.id == selectedMicrophoneID }?.channels ?? 1 }
     var decibelText: String { audioDecibels <= -100 ? "−∞ dBFS" : String(format: "%.1f dBFS", audioDecibels) }
-    var permissionsReady: Bool { screenAccessGranted && (selectedMicrophoneID.isEmpty || microphoneAuthorization == .authorized) }
+    var permissionsReady: Bool {
+        screenAccessGranted && (selectedMicrophoneID.isEmpty || microphoneAuthorization == .authorized)
+            && (cameraPlacement == .off || cameraAuthorization == .authorized)
+    }
+    var cameraConfiguration: CameraConfiguration {
+        CameraConfiguration(deviceID: selectedCameraID.isEmpty ? nil : selectedCameraID,
+            placement: cameraPlacement, overlay: cameraOverlay, mirrored: mirrorsCamera)
+    }
+    var activeRegionIsCamera: Bool { isCameraRegion(selectedRegion) }
+    func isCameraRegion(_ region: CaptureRegion) -> Bool {
+        hasTwoRegions && ((region == .primary && cameraPlacement == .regionA)
+            || (region == .secondary && cameraPlacement == .regionB))
+    }
     var selectedDisplay: DisplayChoice? { displays.first { $0.id == selectedDisplayID } }
     var hasTwoRegions: Bool { layout != .single }
     var activeCaptureFrame: CGRect { selectedRegion == .primary ? captureFrame : secondaryCaptureFrame }
@@ -230,6 +264,7 @@ final class RecorderModel {
     func refreshPermissions() {
         screenAccessGranted = CGPreflightScreenCaptureAccess()
         microphoneAuthorization = AVCaptureDevice.authorizationStatus(for: .audio)
+        cameraAuthorization = AVCaptureDevice.authorizationStatus(for: .video)
     }
 
     private func presentOnboardingIfNeeded() -> Bool {
@@ -263,8 +298,98 @@ final class RecorderModel {
         }
     }
 
+    func requestCameraAccess() async {
+        guard !requestingCamera, !isBusy, !isRecording else { return }
+        requestingCamera = true
+        defer { requestingCamera = false }
+        if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+            _ = await AVCaptureDevice.requestAccess(for: .video)
+        } else if AVCaptureDevice.authorizationStatus(for: .video) != .authorized {
+            openCameraPermissions()
+        }
+        refreshPermissions()
+        refreshCameras()
+    }
+
+    func openCameraPermissions() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    func refreshCameras() {
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera, .external, .continuityCamera], mediaType: .video, position: .unspecified)
+        cameras = discovery.devices.map { CameraChoice(id: $0.uniqueID, name: $0.localizedName) }
+        // Preserve a missing selection so reconnecting never silently uses another camera.
+        if selectedCameraID.isEmpty {
+            selectedCameraID = AVCaptureDevice.default(for: .video)?.uniqueID ?? cameras.first?.id ?? ""
+        }
+    }
+
+    func setCameraPlacement(_ value: CameraPlacement) async {
+        let value: CameraPlacement = !hasTwoRegions && (value == .regionA || value == .regionB) ? .overlay : value
+        guard value != cameraPlacement else { return }
+        await reconfigureCamera(placement: value, deviceID: selectedCameraID)
+    }
+
+    func setCameraDevice(_ id: String) async {
+        guard id != selectedCameraID else { return }
+        await reconfigureCamera(placement: cameraPlacement, deviceID: id)
+    }
+
+    private func reconfigureCamera(placement: CameraPlacement, deviceID: String) async {
+        guard !isRecording && !isBusy && !isShuttingDown else { return }
+        commitFrameEdits?()
+        isBusy = true
+        defer { isBusy = false }
+        let wasPreviewing = isPreviewing
+        if wasPreviewing {
+            await engine.stopPreview()
+            isPreviewing = false
+            previewSurface.clear()
+            audioLevel = 0
+            audioDecibels = -120
+        }
+        guard !isShuttingDown else { return }
+        cameraPlacement = placement
+        selectedCameraID = deviceID
+        saveCameraSettings()
+        refreshPermissions()
+        if isFrameVisible { showFrame() }
+        if wasPreviewing, permissionsReady {
+            do { try await beginPreview() }
+            catch { errorMessage = error.localizedDescription }
+        }
+    }
+
+    func setCameraOverlay(_ value: CameraOverlayConfiguration) {
+        guard !isBusy && !isShuttingDown else { return }
+        cameraOverlay = value.clamped(in: outputSize)
+        saveCameraSettings()
+        engine.updateCamera(cameraConfiguration)
+    }
+
+    func setMirrorsCamera(_ value: Bool) {
+        guard !isBusy && !isShuttingDown else { return }
+        mirrorsCamera = value
+        saveCameraSettings()
+        engine.updateCamera(cameraConfiguration)
+    }
+
+    private func saveCameraSettings() {
+        let defaults = UserDefaults.standard
+        defaults.set(selectedCameraID, forKey: "cameraID")
+        defaults.set(cameraPlacement.rawValue, forKey: "cameraPlacement")
+        defaults.set(mirrorsCamera, forKey: "mirrorsCamera")
+        defaults.set(cameraOverlay.center.x, forKey: "cameraCenterX")
+        defaults.set(cameraOverlay.center.y, forKey: "cameraCenterY")
+        defaults.set(cameraOverlay.widthFraction, forKey: "cameraWidthFraction")
+        defaults.set(cameraOverlay.shape.rawValue, forKey: "cameraShape")
+    }
+
     func setFrameWidth(_ width: Double) {
-        guard width.isFinite, width > 0, !isRecording && !isBusy else { return }
+        guard width.isFinite, width > 0, !isRecording && !isBusy, !activeRegionIsCamera else { return }
         frameWidth = width
         resizeFrame()
     }
@@ -290,10 +415,15 @@ final class RecorderModel {
         commitFrameEdits?()
         let previousCells = [destinationRect(for: .primary), secondaryOutputCell ?? destinationRect(for: .secondary)]
         layout = value
+        if value == .single && (cameraPlacement == .regionA || cameraPlacement == .regionB) {
+            cameraPlacement = .overlay
+            saveCameraSettings()
+        }
         if value == .single { selectedRegion = .primary }
         remapFrames(from: previousCells)
         saveFramePosition()
         updateComposition()
+        engine.updateCamera(cameraConfiguration)
         if isFrameVisible { showFrame() }
     }
 
@@ -389,6 +519,8 @@ final class RecorderModel {
         guard !isShuttingDown, selectedDisplay != nil else { return }
         let previousCells = CaptureRegion.allCases.map { destinationRect(for: $0) }
         orientation = value
+        cameraOverlay = cameraOverlay.clamped(in: outputSize)
+        saveCameraSettings()
         remapFrames(from: previousCells)
         saveFramePosition()
         refreshOverlay()
@@ -426,6 +558,7 @@ final class RecorderModel {
             selectedMicrophoneID = ""
         }
         if microphoneChannel >= microphoneChannels { microphoneChannel = -1 }
+        refreshCameras()
     }
 
     func selectDisplay(_ id: CGDirectDisplayID) {
@@ -474,11 +607,13 @@ final class RecorderModel {
 
     func showFrame() {
         guard !isShuttingDown, let display = selectedDisplay else { return }
-        overlay.show(frame: captureFrame, displayFrame: display.visibleFrame, guides: showsGuides,
+        if !isCameraRegion(.primary) {
+            overlay.show(frame: captureFrame, displayFrame: display.visibleFrame, guides: showsGuides,
             guideBottomInset: layout == .stacked ? 0.08 : guideBottomInset,
             label: hasTwoRegions ? regionTitle(.primary) : nil, accent: .systemCyan,
-            isSelected: selectedRegion == .primary)
-        if hasTwoRegions {
+                isSelected: selectedRegion == .primary)
+        } else { overlay.hide() }
+        if hasTwoRegions && !isCameraRegion(.secondary) {
             secondaryOverlay.show(frame: secondaryCaptureFrame, displayFrame: display.visibleFrame, guides: showsGuides,
                 guideBottomInset: guideBottomInset, label: regionTitle(.secondary), accent: .systemOrange,
                 isSelected: selectedRegion == .secondary)
@@ -642,7 +777,10 @@ final class RecorderModel {
         refreshPermissions()
         guard permissionsReady else {
             showOnboarding = true
-            throw SetupError("Complete screen and microphone access in the setup panel, then start preview.")
+            throw SetupError("Complete access for your enabled inputs in the setup panel, then start preview.")
+        }
+        if cameraPlacement != .off && !cameras.contains(where: { $0.id == selectedCameraID }) {
+            throw SetupError("Choose a connected camera, or set Camera to Off to record only the screen.")
         }
         guard !isShuttingDown, revision == displayRevision else { throw CancellationError() }
         showFrame()
@@ -653,7 +791,7 @@ final class RecorderModel {
             showsCursor: showsCursor, outputSize: outputSize,
             microphoneChannel: microphoneChannel < 0 ? nil : microphoneChannel,
             secondaryCaptureFrame: hasTwoRegions ? secondaryCaptureFrame : nil,
-            layout: layout, splitRatio: splitRatio
+            layout: layout, splitRatio: splitRatio, camera: cameraConfiguration
         ))
         guard !isShuttingDown, revision == displayRevision else {
             await engine.stopPreview()
@@ -662,17 +800,20 @@ final class RecorderModel {
         // Handles can move while ScreenCaptureKit is starting. Reconcile the
         // latest source frames after the worker exists, before exposing preview.
         updateComposition()
+        engine.updateCamera(cameraConfiguration)
         isPreviewing = true
     }
 
     private func refreshOverlay() {
         guard isFrameVisible, let display = selectedDisplay else { return }
-        overlay.update(frame: captureFrame, displayFrame: display.visibleFrame,
+        if !isCameraRegion(.primary) {
+            overlay.update(frame: captureFrame, displayFrame: display.visibleFrame,
             guides: showsGuides, recording: isRecording,
             guideBottomInset: layout == .stacked ? 0.08 : guideBottomInset,
             label: hasTwoRegions ? regionTitle(.primary) : nil, accent: .systemCyan,
-            isSelected: selectedRegion == .primary)
-        if hasTwoRegions {
+                isSelected: selectedRegion == .primary)
+        } else { overlay.hide() }
+        if hasTwoRegions && !isCameraRegion(.secondary) {
             secondaryOverlay.update(frame: secondaryCaptureFrame, displayFrame: display.visibleFrame,
                 guides: showsGuides, recording: isRecording, guideBottomInset: guideBottomInset,
                 label: regionTitle(.secondary), accent: .systemOrange, isSelected: selectedRegion == .secondary)

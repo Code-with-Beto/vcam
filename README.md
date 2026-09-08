@@ -8,6 +8,7 @@ Built for our own workflow at Code with Beto. This is an early version and will 
 
 - A movable 9:16 recording frame, with free, horizontal, and vertical movement.
 - Two independent regions in side-by-side or stacked layouts, with a divider you can adjust while recording.
+- Add your camera to either region, or use a movable, resizable camera overlay above the screen layout.
 - Composition and caption guides that do not appear in the saved video.
 - Live preview, microphone selection, input-channel controls, and a decibel meter.
 - 1080 × 1920 or 1440 × 2560 (2K) MP4 export at 30 or 60 fps.
@@ -26,6 +27,8 @@ open vcam/vcam.xcodeproj
 2. Follow the access setup, select your microphone, and choose a save folder.
 3. Choose **Single region**, **Side by side**, or **Stacked**, then show and position the frames. Start preview and press **Record** when ready. In split layouts, drag the preview divider to adjust the balance; both regions are saved in one video.
 4. Stop recording to save the video and open it automatically in **QuickTime Player**.
+
+To include your face, choose a camera placement and device, then enable Camera access. **Floating overlay** keeps both screen regions; drag the camera or its resize handle in the preview, even while recording. In a split layout, the camera can also fill **Region A** or **Region B**. Your microphone is selected separately.
 
 **⇧⌘R** starts or stops recording. **⇧⌘F** shows or hides the frame while idle.
 

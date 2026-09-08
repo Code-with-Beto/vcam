@@ -13,6 +13,64 @@ struct CaptureConfiguration: Sendable {
     var secondaryCaptureFrame: CGRect? = nil
     var layout: CaptureLayout = .single
     var splitRatio: Double = 0.5
+    var camera = CameraConfiguration()
+}
+
+enum CameraPlacement: String, CaseIterable, Identifiable, Sendable {
+    case off, overlay, regionA, regionB
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .off: return "Off"
+        case .overlay: return "Floating overlay"
+        case .regionA: return "Replace region A"
+        case .regionB: return "Replace region B"
+        }
+    }
+}
+
+enum CameraShape: String, CaseIterable, Identifiable, Sendable {
+    case circle, roundedRectangle
+    var id: String { rawValue }
+    var title: String { self == .circle ? "Circle" : "Rounded rectangle" }
+}
+
+struct CameraOverlayConfiguration: Sendable, Equatable {
+    /// Normalized output coordinates measured from the top-left, matching the UI.
+    var center = CGPoint(x: 0.78, y: 0.20)
+    var widthFraction: Double = 0.30
+    var shape: CameraShape = .circle
+
+    func clamped(in outputSize: CGSize) -> CameraOverlayConfiguration {
+        var result = self
+        result.widthFraction = widthFraction.isFinite ? min(max(widthFraction, 0.15), 0.65) : 0.30
+        let width = min(outputSize.width, outputSize.height) * result.widthFraction
+        let height = shape == .circle ? width : width * 0.75
+        let halfX = width / max(outputSize.width, 1) / 2
+        let halfY = height / max(outputSize.height, 1) / 2
+        result.center.x = min(max(center.x.isFinite ? center.x : 0.78, halfX), 1 - halfX)
+        result.center.y = min(max(center.y.isFinite ? center.y : 0.20, halfY), 1 - halfY)
+        return result
+    }
+
+    /// The circle is square; rounded rectangles use a 4:3 frame. Returns pixels
+    /// in Core Image's bottom-left coordinate space, fully inside the canvas.
+    func rect(in outputSize: CGSize) -> CGRect {
+        let normalized = clamped(in: outputSize)
+        let width = min(outputSize.width, outputSize.height) * normalized.widthFraction
+        let height = shape == .circle ? width : width * 0.75
+        return CGRect(x: normalized.center.x * outputSize.width - width / 2,
+            y: (1 - normalized.center.y) * outputSize.height - height / 2,
+            width: width, height: height)
+    }
+}
+
+struct CameraConfiguration: Sendable, Equatable {
+    var deviceID: String? = nil
+    var placement: CameraPlacement = .off
+    var overlay = CameraOverlayConfiguration()
+    var mirrored = true
+    var isEnabled: Bool { deviceID != nil && placement != .off }
 }
 
 enum CaptureLayout: String, CaseIterable, Identifiable, Sendable {

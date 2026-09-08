@@ -2,7 +2,7 @@
 // DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun swiftc \
 //   -D VCAM_CAPTURE_VALIDATION -swift-version 5 -target arm64-apple-macos15.0 \
 //   vcam/CaptureTypes.swift vcam/CapturePCM.swift vcam/CaptureMicrophone.swift \
-//   vcam/CaptureEngine.swift scripts/validate-capture.swift \
+//   vcam/CaptureCamera.swift vcam/CaptureEngine.swift scripts/validate-capture.swift \
 //   -o /tmp/vcam-validate-capture && /tmp/vcam-validate-capture 60
 // Arguments: fps (30 or 60), short edge (1080 or 1440), orientation (portrait or landscape).
 // Defaults: 30 1080 portrait. Example: /tmp/vcam-validate-capture 30 1440 landscape

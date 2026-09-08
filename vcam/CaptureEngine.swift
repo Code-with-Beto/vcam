@@ -129,6 +129,8 @@ final class CaptureEngine {
             await newWorker.beginRendering(clock: newStream.synchronizationClock)
             try await newWorker.startMicrophone()
             guard generation == token else { throw CancellationError() }
+            try await newWorker.startCamera()
+            guard generation == token else { throw CancellationError() }
         } catch {
             await newWorker.shutdown()
             try? await newStream.stopCapture()
@@ -141,6 +143,8 @@ final class CaptureEngine {
     }
 
     func updateCrop(_ frame: CGRect) { worker?.updateCrop(frame) }
+
+    func updateCamera(_ configuration: CameraConfiguration) { worker?.updateCamera(configuration) }
 
     func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double) {
         worker?.updateComposition(primaryFrame: primaryFrame, secondaryFrame: secondaryFrame,
@@ -181,7 +185,7 @@ private final class CapturePreviewFrame: @unchecked Sendable {
 }
 
 /// Queue confinement includes the timer, writer, crop, frame cache, and stream callbacks.
-final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
+final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, AVCaptureVideoDataOutputSampleBufferDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "dev.codewithbeto.vcam.capture", qos: .userInitiated)
     var onPreview: (@Sendable (CGImage) -> Void)?
     var onPreviewPixelBuffer: (@Sendable (CVPixelBuffer) -> Void)?
@@ -204,6 +208,10 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     private var previewPool: CVPixelBufferPool?
     private var previewDeliveryPending = false
     private var microphoneCapture: CaptureMicrophone?
+    private var cameraCapture: CaptureCamera?
+    private var cameraConfiguration: CameraConfiguration
+    private var latestCameraBuffer: CVPixelBuffer?
+    private var lastCameraAt: CFTimeInterval?
     private var selectedMicrophoneChannel: Int?
     private var latchedMicrophoneChannel: Int?
     private var microphoneSampleRate: Double?
@@ -244,6 +252,8 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
 
     init(configuration: CaptureConfiguration) {
         self.configuration = configuration
+        cameraConfiguration = configuration.camera
+        cameraConfiguration.overlay = configuration.camera.overlay.clamped(in: configuration.outputSize)
         composition = CaptureComposition(layout: configuration.layout,
             splitRatio: CaptureLayout.clampedSplitRatio(configuration.splitRatio),
             primaryFrame: configuration.captureFrame, secondaryFrame: configuration.secondaryCaptureFrame)
@@ -306,6 +316,39 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         }
     }
 
+    func startCamera() async throws {
+        guard configuration.camera.isEnabled, let deviceID = configuration.camera.deviceID else { return }
+        let camera = CaptureCamera()
+        let shouldStart: Bool = await withCheckedContinuation { continuation in
+            queue.async {
+                guard self.active else { continuation.resume(returning: false); return }
+                self.cameraCapture = camera
+                self.lastCameraAt = CACurrentMediaTime()
+                continuation.resume(returning: true)
+            }
+        }
+        guard shouldStart else { throw CancellationError() }
+        try await camera.start(deviceID: deviceID, framesPerSecond: configuration.framesPerSecond,
+            delegate: self, sampleQueue: queue) { [weak self] message in
+            self?.queue.async { [weak self] in self?.fail(message) }
+        }
+        let stillActive: Bool = await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: self.active && self.cameraCapture === camera) }
+        }
+        if !stillActive { await camera.stop(); throw CancellationError() }
+    }
+
+    func updateCamera(_ configuration: CameraConfiguration) {
+        queue.async {
+            // Changing devices needs the parent's preview restart. An already
+            // active camera can move between overlay and replacement cells.
+            guard configuration.deviceID == self.cameraConfiguration.deviceID,
+                  !configuration.isEnabled || self.configuration.camera.isEnabled else { return }
+            self.cameraConfiguration = configuration
+            self.cameraConfiguration.overlay = configuration.overlay.clamped(in: self.outputRect.size)
+        }
+    }
+
     func previewWasDelivered() {
         queue.async { self.previewDeliveryPending = false }
     }
@@ -345,12 +388,13 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
                         return
                     }
                     continuation.resume(returning: self.latestBuffer != nil &&
-                        (self.configuration.microphoneID == nil || self.microphoneFormat != nil))
+                        (self.configuration.microphoneID == nil || self.microphoneFormat != nil) &&
+                        (!self.cameraConfiguration.isEnabled || self.latestCameraBuffer != nil))
                 }
             }
             if ready { break }
             if ContinuousClock.now >= deadline {
-                throw CaptureError.message("The screen or selected microphone did not become ready. Check access and the microphone connection, then try again.")
+                throw CaptureError.message("The screen, camera, or selected microphone did not become ready. Check access and device connections, then try again.")
             }
             try await Task.sleep(for: .milliseconds(75))
         }
@@ -441,20 +485,26 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
 
     func shutdown() async {
         _ = try? await stopRecording()
-        let microphone: CaptureMicrophone? = await withCheckedContinuation { continuation in
+        let devices: (CaptureMicrophone?, CaptureCamera?) = await withCheckedContinuation { continuation in
             queue.async {
-                let microphone = self.microphoneCapture
+                let devices = (self.microphoneCapture, self.cameraCapture)
+                self.active = false
+                self.timer?.cancel()
+                self.timer = nil
                 self.microphoneCapture = nil
-                continuation.resume(returning: microphone)
+                self.cameraCapture = nil
+                continuation.resume(returning: devices)
             }
         }
-        await microphone?.stop()
+        await devices.0?.stop()
+        await devices.1?.stop()
         await withCheckedContinuation { continuation in
             queue.async {
                 self.active = false
                 self.timer?.cancel()
                 self.timer = nil
                 self.latestBuffer = nil
+                self.latestCameraBuffer = nil
                 self.previewPool = nil
                 self.expectedStream = nil
                 if let observer = self.disconnectObserver {
@@ -493,6 +543,16 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if let camera = cameraCapture, output === camera.output {
+            guard active, CMSampleBufferIsValid(sampleBuffer), CMSampleBufferDataIsReady(sampleBuffer),
+                  let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            // Only retain the newest frame; camera audio never enters this path.
+            // The output timer uses its existing screen/audio clock, sampling the
+            // latest camera image without assuming the camera PTS shares an epoch.
+            latestCameraBuffer = buffer
+            lastCameraAt = CACurrentMediaTime()
+            return
+        }
         guard active, let microphone = microphoneCapture, output === microphone.output,
               CMSampleBufferIsValid(sampleBuffer), CMSampleBufferDataIsReady(sampleBuffer),
               let sourceClock = microphone.synchronizationClock else { return }
@@ -577,12 +637,47 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         if destinations.count > 1, let secondary = state.secondaryFrame {
             result = regionImage(source, frame: secondary, destination: destinations[1]).composited(over: result)
         }
+        if cameraConfiguration.isEnabled, let buffer = latestCameraBuffer {
+            // Camera sources may be Rec.709 YCbCr or tagged RGB. Let Core Image
+            // read those attachments, then convert through the linear working
+            // space into the same sRGB output as the screen; never relabel them.
+            var camera = CIImage(cvPixelBuffer: buffer)
+            if cameraConfiguration.mirrored {
+                camera = camera.transformed(by: CGAffineTransform(a: -1, b: 0, c: 0, d: 1,
+                    tx: camera.extent.minX + camera.extent.maxX, ty: 0))
+            }
+            switch cameraConfiguration.placement {
+            case .off: break
+            case .regionA:
+                result = fittedImage(camera, crop: camera.extent, destination: destinations[0]).composited(over: result)
+            case .regionB:
+                if destinations.count > 1 {
+                    result = fittedImage(camera, crop: camera.extent, destination: destinations[1]).composited(over: result)
+                }
+            case .overlay:
+                let overlay = cameraConfiguration.overlay
+                let rect = overlay.rect(in: outputRect.size)
+                let image = fittedImage(camera, crop: camera.extent, destination: rect)
+                let radius = overlay.shape == .circle ? rect.width / 2 : rect.height * 0.14
+                let mask = CIFilter(name: "CIRoundedRectangleGenerator", parameters: [
+                    "inputExtent": CIVector(cgRect: rect), "inputRadius": radius, "inputColor": CIColor.white
+                ])!.outputImage!
+                result = image.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                    kCIInputBackgroundImageKey: result, kCIInputMaskImageKey: mask
+                ])
+            }
+        }
         return result.cropped(to: outputRect)
     }
 
     private func regionImage(_ source: CIImage, frame: CGRect, destination: CGRect) -> CIImage {
-        var crop = CaptureGeometry.sourcePixelCrop(frame,
+        let crop = CaptureGeometry.sourcePixelCrop(frame,
             displayFrame: configuration.displayFrame, pixelSize: source.extent.size)
+        return fittedImage(source, crop: crop, destination: destination)
+    }
+
+    private func fittedImage(_ source: CIImage, crop requestedCrop: CGRect, destination: CGRect) -> CIImage {
+        var crop = requestedCrop
         let destinationAspect = destination.width / destination.height
         let sourceAspect = crop.width / crop.height
         // UI frames follow their destination aspect. If an update or restored
@@ -620,6 +715,9 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
             if latestBuffer == nil { fail("No screen frames arrived. Check Screen Recording access and reopen the camera.") }
             if configuration.microphoneID != nil, now - (lastMicrophoneAt ?? startedAt) > 6 {
                 fail("The selected microphone stopped delivering audio. Check its connection and microphone access.")
+            }
+            if cameraConfiguration.isEnabled, now - (lastCameraAt ?? startedAt) > 6 {
+                fail("The selected camera stopped delivering video. Check its connection and Camera access, then reopen preview.")
             }
         }
         drainAudio()
@@ -847,7 +945,8 @@ extension CaptureWorker {
     /// Returned times are phase midpoints on the encoded movie's timeline.
     static func recordCompositionFixture(_ buffer: CVPixelBuffer, displayFrame: CGRect,
                                          phases: [CaptureComposition], to url: URL,
-                                         outputSize: CGSize) async throws -> (url: URL, sampleTimes: [Double]) {
+                                         outputSize: CGSize, cameraBuffer: CVPixelBuffer? = nil,
+                                         cameras: [CameraConfiguration] = []) async throws -> (url: URL, sampleTimes: [Double]) {
         guard let initial = phases.first else { throw CaptureError.message("The composition fixture needs an initial phase.") }
         var config = CaptureConfiguration(displayID: CGMainDisplayID(), displayFrame: displayFrame,
             captureFrame: initial.primaryFrame, framesPerSecond: 30,
@@ -856,8 +955,10 @@ extension CaptureWorker {
         config.secondaryCaptureFrame = initial.secondaryFrame
         config.layout = initial.layout
         config.splitRatio = initial.splitRatio
+        config.camera = cameras.first ?? CameraConfiguration()
         let worker = CaptureWorker(configuration: config)
         let frame = SyntheticFrame(buffer)
+        let camera = cameraBuffer.map(SyntheticFrame.init)
         let audio = SyntheticAudioState()
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             worker.queue.async {
@@ -865,6 +966,8 @@ extension CaptureWorker {
                 worker.startedAt = CACurrentMediaTime()
                 worker.captureClock = CMClockGetHostTimeClock()
                 worker.latestBuffer = frame.buffer
+                worker.latestCameraBuffer = camera?.buffer
+                worker.lastCameraAt = CACurrentMediaTime()
                 do {
                     let time = CMClockGetTime(CMClockGetHostTimeClock())
                     worker.processMicrophone(try syntheticMicrophoneSample(count: 512, offset: 0,
@@ -877,9 +980,10 @@ extension CaptureWorker {
             await worker.beginRendering(clock: CMClockGetHostTimeClock())
             try await worker.startRecording(to: url)
             var times: [Double] = []
-            for phase in phases {
+            for (index, phase) in phases.enumerated() {
                 worker.updateComposition(primaryFrame: phase.primaryFrame, secondaryFrame: phase.secondaryFrame,
                     layout: phase.layout, splitRatio: phase.splitRatio)
+                if cameras.indices.contains(index) { worker.updateCamera(cameras[index]) }
                 let phaseStart: Double = await withCheckedContinuation { continuation in
                     worker.queue.async {
                         continuation.resume(returning: CMTimeSubtract(worker.captureTime()!, worker.firstVideoTime!).seconds)
@@ -888,6 +992,7 @@ extension CaptureWorker {
                 for _ in 0..<12 {
                     try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                         worker.queue.async {
+                            if camera != nil { worker.lastCameraAt = CACurrentMediaTime() }
                             let first = worker.firstVideoTime!
                             let elapsed = CMTimeSubtract(worker.captureTime()!, first).seconds
                             let count = max(1, Int(elapsed * 48_000) - audio.sampleCount)

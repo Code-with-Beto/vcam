@@ -3,7 +3,7 @@
 // sed 's/UserDefaults\.standard/ModelValidation.defaults/g' vcam/RecorderModel.swift \
 //   > /tmp/vcam-model-validation-source.swift
 // xcrun swiftc -swift-version 5 -target arm64-apple-macos15.0 \
-//   vcam/CaptureTypes.swift vcam/CapturePCM.swift vcam/CaptureMicrophone.swift \
+//   vcam/CaptureTypes.swift vcam/CapturePCM.swift vcam/CaptureMicrophone.swift vcam/CaptureCamera.swift \
 //   vcam/CaptureEngine.swift vcam/CameraPreview.swift vcam/SafeAreaGuide.swift \
 //   vcam/FrameOverlay.swift vcam/GlobalShortcuts.swift \
 //   /tmp/vcam-model-validation-source.swift scripts/validate-model.swift \
@@ -82,9 +82,12 @@ struct ValidateModel {
             try await validateLayoutTransitions()
             try await validateLayoutScaleRoundtrip()
             try validateSecondaryMetadata()
+            try await validateCameraDefaultsAndOverlay()
+            try await validateCameraRegionTransitions()
+            try await validateCameraOverlayPersistence()
             try ModelValidation.require(application.windows.allSatisfy { !$0.isVisible },
                                         "Validation unexpectedly displayed a window")
-            print("PASS: Model split roundtrips, display clamping, independent B sizing, layout/orientation aspects, and secondary persistence metadata. Preferences used an isolated temporary suite.")
+            print("PASS: Model split roundtrips, display clamping, independent B sizing, layout/orientation aspects, secondary persistence metadata, and camera placement/geometry/persistence without starting inputs. Preferences used an isolated temporary suite.")
         } catch {
             fputs("FAIL: \(error.localizedDescription)\n", stderr)
             exit(1)
@@ -251,5 +254,137 @@ struct ValidateModel {
         try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second, "B orientation roundtrip")
         try ModelValidation.validRegions(model)
         print("Layout/orientation roundtrips preserve independent A/B screen-points-per-output-pixel scales, including a visit to single mode.")
+    }
+
+    @MainActor
+    private static func validateCameraDefaultsAndOverlay() async throws {
+        let model = try ModelValidation.makeModel()
+        try ModelValidation.require(model.cameraPlacement == .off && !model.cameraConfiguration.isEnabled,
+                                    "A fresh model unexpectedly enabled its camera")
+        try ModelValidation.require(model.selectedCameraID.isEmpty && model.cameras.isEmpty,
+                                    "Fresh model construction unexpectedly discovered or selected a camera")
+        model.setLayout(.stacked)
+        model.selectedMicrophoneID = "synthetic-model-microphone"
+        let first = model.captureFrame, second = model.secondaryCaptureFrame
+        let outputSize = model.outputSize
+        await model.setCameraDevice("synthetic-model-camera-A")
+        try ModelValidation.require(model.cameraPlacement == .off && !model.cameraConfiguration.isEnabled,
+                                    "Choosing a camera device enabled it while placement was Off")
+        await model.setCameraPlacement(.overlay)
+        try ModelValidation.require(model.cameraPlacement == .overlay && model.cameraConfiguration.isEnabled,
+                                    "Floating overlay did not retain the chosen camera configuration")
+        try ModelValidation.require(model.captureFrame == first && model.secondaryCaptureFrame == second,
+                                    "Enabling a floating camera overlay moved or resized a screen region")
+        try ModelValidation.require(model.outputSize == outputSize && model.layout == .stacked,
+                                    "Enabling a camera overlay changed the output canvas or layout")
+        try ModelValidation.require(model.selectedMicrophoneID == "synthetic-model-microphone",
+                                    "Enabling the camera substituted the chosen microphone")
+        model.setMirrorsCamera(false)
+        try ModelValidation.require(!model.mirrorsCamera && !model.cameraConfiguration.mirrored,
+                                    "Mirror control did not propagate to camera configuration")
+        await model.setCameraDevice("synthetic-model-camera-B")
+        try ModelValidation.require(model.cameraConfiguration.deviceID == "synthetic-model-camera-B"
+                                    && model.cameraPlacement == .overlay,
+                                    "Changing a camera device lost placement or retained the old device")
+        try ModelValidation.require(model.cameras.isEmpty && !model.requestingCamera && !model.showOnboarding,
+                                    "Idle camera settings unexpectedly discovered devices or began onboarding")
+        try ModelValidation.validRegions(model)
+        print("Camera defaults/overlay: Off on first use; device, mirror, and placement settings preserve both screen regions, output, and microphone without opening inputs.")
+    }
+
+    @MainActor
+    private static func validateCameraRegionTransitions() async throws {
+        for orientation in [CaptureOrientation.portrait, .landscape] {
+            let model = try ModelValidation.makeModel()
+            await model.setOrientation(orientation)
+            await model.setCameraDevice("synthetic-model-camera")
+            for layout in [CaptureLayout.stacked, .sideBySide] {
+                model.setLayout(layout)
+                let first = model.captureFrame, second = model.secondaryCaptureFrame
+                for placement in [CameraPlacement.overlay, .regionA, .regionB, .off] {
+                    await model.setCameraPlacement(placement)
+                    try ModelValidation.require(model.cameraPlacement == placement,
+                                                "Split layout changed requested camera placement")
+                    try ModelValidation.require(model.isCameraRegion(.primary) == (placement == .regionA)
+                                                && model.isCameraRegion(.secondary) == (placement == .regionB),
+                                                "Camera replacement identified the wrong screen region")
+                    if placement == .regionA || placement == .regionB {
+                        model.selectRegion(placement == .regionA ? .primary : .secondary)
+                        try ModelValidation.require(model.activeRegionIsCamera,
+                                                    "Selected camera region was exposed as a screen region")
+                        let before = model.activeCaptureFrame
+                        model.setFrameWidth(before.width * 0.75)
+                        model.setFrameHeight(before.height * 0.75)
+                        try ModelValidation.require(model.activeCaptureFrame == before,
+                                                    "Screen-size setters resized a camera-backed region")
+                    }
+                    try ModelValidation.require(model.captureFrame == first && model.secondaryCaptureFrame == second,
+                                                "Camera placement discarded or altered the saved screen rectangles")
+                    try ModelValidation.validRegions(model)
+                }
+                try ModelValidation.require(!model.activeRegionIsCamera,
+                                            "Turning camera Off did not restore the selected screen region")
+                await model.setCameraPlacement(.regionB)
+                model.setLayout(.single)
+                try ModelValidation.require(model.cameraPlacement == .overlay && !model.hasTwoRegions
+                                            && model.selectedRegion == .primary && !model.activeRegionIsCamera,
+                                            "Single layout did not safely convert the camera region into a floating overlay")
+                try ModelValidation.validRegions(model)
+                for placement in [CameraPlacement.regionA, .regionB] {
+                    await model.setCameraPlacement(placement)
+                    try ModelValidation.require(model.cameraPlacement == .overlay,
+                                                "Single layout accepted an unavailable camera replacement region")
+                    try ModelValidation.validRegions(model)
+                }
+                await model.setCameraPlacement(.off)
+            }
+        }
+        print("Camera regions: A/B replacement preserves hidden screen rectangles, rejects screen resizing, restores them when Off, and converts to an overlay in Single mode across both orientations.")
+    }
+
+    @MainActor
+    private static func validateCameraOverlayPersistence() async throws {
+        let model = try ModelValidation.makeModel()
+        await model.setCameraDevice("synthetic-persisted-camera")
+        await model.setCameraPlacement(.overlay)
+        model.setMirrorsCamera(false)
+        for shape in CameraShape.allCases {
+            model.setCameraOverlay(CameraOverlayConfiguration(center: CGPoint(x: -10, y: 10),
+                                                               widthFraction: 4, shape: shape))
+            try validateCameraRect(model, label: "Out-of-bounds \(shape.title)")
+            try ModelValidation.require(model.cameraOverlay.widthFraction == 0.65,
+                                        "Oversized camera overlay did not clamp to its maximum size")
+            model.setCameraOverlay(CameraOverlayConfiguration(center: CGPoint(x: CGFloat.nan, y: CGFloat.infinity),
+                                                               widthFraction: .nan, shape: shape))
+            try validateCameraRect(model, label: "Nonfinite \(shape.title)")
+            await model.setOrientation(.landscape)
+            try validateCameraRect(model, label: "Landscape \(shape.title)")
+            await model.setOrientation(.portrait)
+        }
+        model.setCameraOverlay(CameraOverlayConfiguration(center: CGPoint(x: 0.32, y: 0.68),
+                                                           widthFraction: 0.42, shape: .roundedRectangle))
+        let expected = model.cameraOverlay
+        let restored = RecorderModel()
+        try ModelValidation.require(restored.cameraOverlay == expected && restored.cameraPlacement == .overlay
+                                    && restored.selectedCameraID == "synthetic-persisted-camera" && !restored.mirrorsCamera,
+                                    "Camera placement, position, size, shape, device, or mirror setting did not survive model recreation")
+        try validateCameraRect(restored, label: "Restored overlay")
+        try ModelValidation.require(!restored.isPreviewing && !restored.isRecording && !restored.isFrameVisible
+                                    && !restored.requestingCamera && restored.cameras.isEmpty,
+                                    "Restoring camera settings opened an input, window, or permission request")
+        try ModelValidation.validRegions(model)
+        print("Camera overlay persistence: shape, device, mirroring, position, and size survive recreation; invalid coordinates and sizes remain within portrait/landscape output bounds.")
+    }
+
+    @MainActor
+    private static func validateCameraRect(_ model: RecorderModel, label: String) throws {
+        let frame = model.cameraOverlay.rect(in: model.outputSize)
+        let canvas = CGRect(origin: .zero, size: model.outputSize).insetBy(dx: -0.001, dy: -0.001)
+        try ModelValidation.require(frame.width.isFinite && frame.height.isFinite
+                                    && frame.width > 0 && frame.height > 0 && canvas.contains(frame),
+                                    "\(label): camera overlay is empty, nonfinite, or outside the output")
+        let expectedAspect: CGFloat = model.cameraOverlay.shape == .circle ? 1 : 4.0 / 3.0
+        try ModelValidation.require(abs(frame.width / frame.height - expectedAspect) < 0.000001,
+                                    "\(label): camera shape aspect ratio changed")
     }
 }
