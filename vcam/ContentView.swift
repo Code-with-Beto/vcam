@@ -84,6 +84,12 @@ struct ContentView: View {
                 Text("Output preview").font(.callout.weight(.semibold))
                 SettingHelp("Output preview", "Resize this window to enlarge the preview. The saved dimensions and on-screen capture frames stay unchanged. The native preview refreshes at up to 30 fps. Guides and vcam controls are never recorded.")
                 Spacer()
+                Toggle(isOn: $model.showsGuides) {
+                    Label("Safe areas", systemImage: "rectangle.dashed")
+                }
+                .toggleStyle(.button).controlSize(.small)
+                .help("Show safe-area guides on the final composition. These guides are never recorded.")
+                .accessibilityLabel("Show preview safe-area guides")
                 Button(model.isFrameVisible ? "Hide frames" : "Show frames") { model.toggleFrame() }
                     .controlSize(.small).disabled(model.isRecording || model.isBusy)
                     .help("Show or hide capture frames: Shift-Command-F")
@@ -123,11 +129,17 @@ struct ContentView: View {
             }
         }
         .overlay {
-            if model.isPreviewing {
-                ZStack {
-                    CompositionDivider(layout: model.layout,
-                        splitRatio: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
-                        isEnabled: !model.isBusy && !model.isAdjustingCameraCrop)
+            ZStack {
+                if model.showsGuides {
+                    SafeAreaPreviewGuide(reservesCaptions: model.reservesCaptions)
+                }
+                CompositionDivider(layout: model.layout, outputSize: model.outputSize,
+                    splitRatio: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
+                    secondSplitRatio: Binding(get: { model.secondSplitRatio }, set: { model.setSecondSplitRatio($0) }),
+                    splitRatioRange: model.splitRatioRange,
+                    secondSplitRatioRange: model.secondSplitRatioRange,
+                    isEnabled: !model.isBusy && !model.isAdjustingCameraCrop)
+                if model.isPreviewing {
                     if model.isAdjustingCameraCrop, let destination = cameraDestinationRect {
                         CameraCropControls(
                             framing: Binding(get: { model.cameraFraming }, set: { model.setCameraFraming($0) }),
@@ -153,20 +165,27 @@ struct ContentView: View {
             return "Drag inside the camera to frame your face. Use Zoom in Live to crop closer, then choose Done. The camera frame stays in place."
         }
         if model.cameraPlacement == .overlay {
-            return "Drag the camera to move it; use its corner to resize. \(model.hasTwoRegions ? "Drag the divider to adjust the split." : "Changes appear in your take.")"
+            return "Drag the camera to move it; use its corner to resize. \(model.hasTwoRegions ? splitPreviewHint : "Changes appear in your take.")"
         }
         return model.hasTwoRegions
-            ? "Drag the divider to adjust the split. Move each capture frame independently on your display."
+            ? "\(splitPreviewHint) Move each capture frame independently on your display."
             : "The full capture frame is recorded. Resize this window for a larger preview."
+    }
+
+    private var splitPreviewHint: String {
+        model.activeRegions.count == 3
+            ? "Drag either divider to resize the three panels."
+            : "Drag the divider to adjust the split."
     }
 
     private var cameraDestinationRect: CGRect? {
         switch model.cameraPlacement {
         case .off: return nil
         case .overlay: return model.cameraOverlay.rect(in: model.outputSize)
-        case .regionA, .regionB:
-            let regions = model.layout.destinationRects(in: model.outputSize, splitRatio: model.splitRatio)
-            let index = model.cameraPlacement == .regionB ? 1 : 0
+        case .regionA, .regionB, .regionC:
+            let regions = model.layout.destinationRects(in: model.outputSize, splitRatio: model.splitRatio,
+                                                        secondSplitRatio: model.secondSplitRatio)
+            let index = model.cameraPlacement == .regionC ? 2 : model.cameraPlacement == .regionB ? 1 : 0
             return regions.indices.contains(index) ? regions[index] : nil
         }
     }
@@ -214,24 +233,46 @@ struct ContentView: View {
 
     private var compositionSettings: some View {
         VStack(alignment: .leading, spacing: 12) {
-            settingTitle("Layout", help: "Single records one region. Stacked places A above B. Switch layouts during a take; the saved video keeps the same resolution and orientation.")
-            Picker("Composition layout", selection: Binding(get: { model.layout }, set: { model.setLayout($0) })) {
-                Text("Single").tag(CaptureLayout.single)
-                Text("Stacked").tag(CaptureLayout.stacked)
-            }.labelsHidden().pickerStyle(.segmented).disabled(model.isBusy)
+            settingTitle("Layout", help: "Record one region, stack A above B, or stack three panels with A at the top, B in the middle, and C at the bottom. Replace any stacked panel with your camera. Switch layouts during a take; the saved video keeps the same resolution and orientation.")
+            CompositionLayoutPicker(
+                selection: Binding(get: { model.layout }, set: { model.setLayout($0) }),
+                isEnabled: !model.isBusy)
             if model.hasTwoRegions {
-                VStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 8) {
                     HStack {
-                        Text("Split").font(.callout)
-                        SettingHelp("Split", "Give either region 15% to 85% of the output. Drag the preview divider or use this slider, including during a take. Source frames resize to match without stretching. The divider itself is not recorded.")
+                        Text("Panel heights").font(.callout)
+                        SettingHelp("Panel heights", "Drag a preview divider or use these sliders during a take. Divider positions are measured from the top of the video. Every panel keeps at least 15% of its height, and the dividers cannot cross. Source frames resize to match without stretching. The dividers are never recorded.")
                         Spacer()
-                        Text(model.splitDescription).font(.caption.monospacedDigit())
-                        Button("50/50") { model.setSplitRatio(0.5) }.controlSize(.small)
+                        Button(model.activeRegions.count == 3 ? "Equal thirds" : "50/50") {
+                            model.equalizeSplit()
+                        }.controlSize(.small)
                     }
-                    Slider(value: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }), in: 0.15...0.85)
-                        .accessibilityLabel("Region A share of output").accessibilityValue(model.splitDescription)
+                    Text(model.splitDescription).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    if model.activeRegions.count == 3 {
+                        splitSlider("Top divider",
+                            value: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
+                            range: model.splitRatioRange)
+                        splitSlider("Bottom divider",
+                            value: Binding(get: { model.secondSplitRatio }, set: { model.setSecondSplitRatio($0) }),
+                            range: model.secondSplitRatioRange)
+                    } else {
+                        Slider(value: Binding(get: { model.splitRatio }, set: { model.setSplitRatio($0) }),
+                               in: model.splitRatioRange)
+                            .accessibilityLabel("Region A share of output").accessibilityValue(model.splitDescription)
+                    }
                 }.disabled(model.isBusy)
             }
+        }
+    }
+
+    private func splitSlider(_ title: String, value: Binding<Double>, range: ClosedRange<Double>) -> some View {
+        HStack(spacing: 8) {
+            Text(title).font(.caption).frame(width: 84, alignment: .leading)
+            Slider(value: value, in: range)
+                .accessibilityLabel(title)
+                .accessibilityValue("\(Int((value.wrappedValue * 100).rounded())) percent from the top")
+            Text("\(Int((value.wrappedValue * 100).rounded()))%")
+                .font(.caption.monospacedDigit()).frame(width: 34, alignment: .trailing)
         }
     }
 
@@ -240,7 +281,7 @@ struct ContentView: View {
             settingTitle("Capture region", help: "Select a region to change how much of your display it captures. Drag its floating handle on screen to move it. Each handle also has horizontal and vertical movement locks. These changes work during recording.")
             if model.hasTwoRegions {
                 Picker("Edit region", selection: Binding(get: { model.selectedRegion }, set: { model.selectRegion($0) })) {
-                    ForEach(CaptureRegion.allCases) { Text(model.regionTitle($0)).tag($0) }
+                    ForEach(model.activeRegions) { Text(model.regionTitle($0)).tag($0) }
                 }.labelsHidden().pickerStyle(.segmented).disabled(model.isBusy)
             }
             if model.activeRegionIsCamera {
@@ -300,7 +341,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Recording format").font(.headline)
             VStack(alignment: .leading, spacing: 7) {
-                settingTitle("Display", help: "Choose the display to capture. Both screen regions can move independently inside this display. Stop preview before switching displays.", prominent: false)
+                settingTitle("Display", help: "Choose the display to capture. All screen regions can move independently inside this display. Stop preview before switching displays.", prominent: false)
                 Picker("Display", selection: Binding(get: { model.selectedDisplayID }, set: { model.selectDisplay($0) })) {
                     ForEach(model.displays) { Text($0.name).tag($0.id) }
                 }.labelsHidden().disabled(model.isPreviewing || model.isBusy)
@@ -359,12 +400,12 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Guides & cursor").font(.headline)
             HStack {
-                Toggle("Edge guides", isOn: $model.showsGuides)
-                SettingHelp("Edge guides", "An 8% side margin helps keep important details clear of platform controls and device cropping. The full outer frame is saved, including shaded areas. These are composition guides, not guaranteed platform safe zones.")
+                Toggle("Preview safe areas", isOn: $model.showsGuides)
+                SettingHelp("Preview safe areas", "An 8% margin on the final output preview helps you place important content away from the edges. The guide spans the complete video, including all stacked panels. The full frame is saved without the guide or its shading. Platform controls vary, so this is a composition aid rather than a guaranteed platform safe zone.")
             }
             HStack {
                 Toggle("Reserve caption space", isOn: $model.reservesCaptions).disabled(!model.showsGuides)
-                SettingHelp("Caption space", "Reserve the lower 20% for subtitles or platform labels. This is only a visual reminder; no content is removed.")
+                SettingHelp("Caption space", "Mark the lower 20% of the final output preview for subtitles or platform labels. The guide appears only in the preview; every panel is still recorded in full.")
             }
             HStack {
                 Toggle("Show cursor", isOn: $model.showsCursor).disabled(model.isPreviewing || model.isBusy)

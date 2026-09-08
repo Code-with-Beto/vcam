@@ -16,7 +16,7 @@ struct CameraSettingsView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 7) {
                 Text(section == .live ? "Camera" : "Camera device").font(.headline)
-                SettingHelp("Camera", "Choose the camera device in Setup. Use Live to add a floating camera, fill either split region, or turn it off during a take. Camera and microphone selections are independent.")
+                SettingHelp("Camera", "Choose the camera device in Setup. Use Live to add a floating camera, fill any stacked panel, or turn it off during a take. Camera and microphone selections are independent.")
                 Spacer()
             }
             if section == .live {
@@ -58,10 +58,13 @@ struct CameraSettingsView: View {
                 if model.hasTwoRegions {
                     Text("Replace \(model.regionTitle(.primary))").tag(CameraPlacement.regionA)
                     Text("Replace \(model.regionTitle(.secondary))").tag(CameraPlacement.regionB)
+                    if model.activeRegions.contains(.tertiary) {
+                        Text("Replace \(model.regionTitle(.tertiary))").tag(CameraPlacement.regionC)
+                    }
                 }
             }
             .labelsHidden().disabled(!canChangePlacement)
-            SettingHelp("Camera placement", "Add a floating camera or fill either region of a split composition. Placement changes appear in the current take. Off leaves screen recording running without the camera. To use another device, finish the take and choose it in Setup.")
+            SettingHelp("Camera placement", "Add a floating camera or fill any panel in a two- or three-panel stack. Placement changes appear in the current take. Off leaves screen recording running without the camera. To use another device, finish the take and choose it in Setup.")
         }
     }
 

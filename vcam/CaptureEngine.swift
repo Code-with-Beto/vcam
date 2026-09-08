@@ -175,9 +175,11 @@ final class CaptureEngine {
     }
 
     func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double,
-                           camera: CameraConfiguration? = nil) {
+                           camera: CameraConfiguration? = nil, tertiaryFrame: CGRect? = nil,
+                           secondSplitRatio: Double = 2.0 / 3.0) {
         worker?.updateComposition(primaryFrame: primaryFrame, secondaryFrame: secondaryFrame,
-                                  layout: layout, splitRatio: splitRatio, camera: camera)
+                                  layout: layout, splitRatio: splitRatio, camera: camera,
+                                  tertiaryFrame: tertiaryFrame, secondSplitRatio: secondSplitRatio)
     }
 
     func startRecording(to url: URL) async throws {
@@ -300,7 +302,8 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
         cameraConfiguration.framing = configuration.camera.framing.clamped()
         composition = CaptureComposition(layout: configuration.layout,
             splitRatio: CaptureLayout.clampedSplitRatio(configuration.splitRatio),
-            primaryFrame: configuration.captureFrame, secondaryFrame: configuration.secondaryCaptureFrame)
+            primaryFrame: configuration.captureFrame, secondaryFrame: configuration.secondaryCaptureFrame,
+            tertiaryFrame: configuration.tertiaryCaptureFrame, secondSplitRatio: configuration.secondSplitRatio)
         outputRect = CGRect(origin: .zero, size: configuration.outputSize)
         let previewScale = min(1, 960 / max(configuration.outputSize.width, configuration.outputSize.height))
         previewRect = CGRect(x: 0, y: 0,
@@ -508,18 +511,23 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     }
 
     func updateComposition(primaryFrame: CGRect, secondaryFrame: CGRect?, layout: CaptureLayout, splitRatio: Double,
-                           camera: CameraConfiguration? = nil) {
+                           camera: CameraConfiguration? = nil, tertiaryFrame: CGRect? = nil,
+                           secondSplitRatio: Double = 2.0 / 3.0) {
         queue.async {
             func valid(_ frame: CGRect) -> Bool {
                 frame.width.isFinite && frame.height.isFinite && frame.minX.isFinite && frame.minY.isFinite &&
                     frame.width > 0 && frame.height > 0
             }
-            guard valid(primaryFrame), secondaryFrame.map(valid) ?? true else { return }
-            // One serial-queue assignment keeps the two source frames and their
+            guard valid(primaryFrame), secondaryFrame.map(valid) ?? true,
+                  tertiaryFrame.map(valid) ?? true,
+                  layout.regionCount < 2 || secondaryFrame != nil,
+                  layout.regionCount < 3 || tertiaryFrame != nil else { return }
+            // One serial-queue assignment keeps all source frames and their
             // destination geometry from being mixed across separate UI updates.
             self.composition = CaptureComposition(layout: layout,
                 splitRatio: CaptureLayout.clampedSplitRatio(splitRatio),
-                primaryFrame: primaryFrame, secondaryFrame: secondaryFrame)
+                primaryFrame: primaryFrame, secondaryFrame: secondaryFrame,
+                tertiaryFrame: tertiaryFrame, secondSplitRatio: secondSplitRatio)
             if let camera { self.applyCameraEdits(camera) }
         }
     }
@@ -805,15 +813,19 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
     }
 
     private func croppedImage(from buffer: CVPixelBuffer) -> CIImage {
-        // Both regions sample the same cached display frame. Moving a region or
+        // All regions sample the same cached display frame. Moving a region or
         // the split never reconfigures capture, timestamps, or the output file.
         let source = CIImage(cvPixelBuffer: buffer, options: [.colorSpace: CaptureColor.space])
         let state = composition
-        let destinations = state.layout.destinationRects(in: outputRect.size, splitRatio: state.splitRatio)
+        let destinations = state.layout.destinationRects(in: outputRect.size, splitRatio: state.splitRatio,
+                                                        secondSplitRatio: state.secondSplitRatio)
         var result = CIImage(color: .black).cropped(to: outputRect)
         result = regionImage(source, frame: state.primaryFrame, destination: destinations[0]).composited(over: result)
         if destinations.count > 1, let secondary = state.secondaryFrame {
             result = regionImage(source, frame: secondary, destination: destinations[1]).composited(over: result)
+        }
+        if destinations.count > 2, let tertiary = state.tertiaryFrame {
+            result = regionImage(source, frame: tertiary, destination: destinations[2]).composited(over: result)
         }
         if cameraConfiguration.isEnabled, let buffer = latestCameraBuffer {
             // Camera sources may be Rec.709 YCbCr or tagged RGB. Let Core Image
@@ -831,6 +843,10 @@ final class CaptureWorker: NSObject, SCStreamOutput, SCStreamDelegate, AVCapture
             case .regionB:
                 if destinations.count > 1 {
                     result = framedCameraImage(camera, destination: destinations[1]).composited(over: result)
+                }
+            case .regionC:
+                if destinations.count > 2 {
+                    result = framedCameraImage(camera, destination: destinations[2]).composited(over: result)
                 }
             case .overlay:
                 let overlay = cameraConfiguration.overlay
@@ -1317,8 +1333,10 @@ extension CaptureWorker {
             microphoneID: "synthetic-microphone", showsCursor: false)
         config.outputSize = outputSize
         config.secondaryCaptureFrame = initial.secondaryFrame
+        config.tertiaryCaptureFrame = initial.tertiaryFrame
         config.layout = initial.layout
         config.splitRatio = initial.splitRatio
+        config.secondSplitRatio = initial.secondSplitRatio
         config.camera = cameras.first ?? CameraConfiguration()
         let frame = SyntheticFrame(buffer)
         let camera = cameraBuffer.map(SyntheticFrame.init)
@@ -1353,7 +1371,9 @@ extension CaptureWorker {
             var times: [Double] = []
             for (index, phase) in phases.enumerated() {
                 worker.updateComposition(primaryFrame: phase.primaryFrame, secondaryFrame: phase.secondaryFrame,
-                    layout: phase.layout, splitRatio: phase.splitRatio)
+                    layout: phase.layout, splitRatio: phase.splitRatio,
+                    camera: cameras.indices.contains(index) ? cameras[index] : nil,
+                    tertiaryFrame: phase.tertiaryFrame, secondSplitRatio: phase.secondSplitRatio)
                 if cameras.indices.contains(index) {
                     let previous = index > 0 ? cameras[index - 1] : config.camera
                     if previous.isEnabled, cameras[index].isEnabled, previous.deviceID == cameras[index].deviceID {

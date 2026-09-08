@@ -14,10 +14,12 @@ struct CaptureConfiguration: Sendable {
     var layout: CaptureLayout = .single
     var splitRatio: Double = 0.5
     var camera = CameraConfiguration()
+    var tertiaryCaptureFrame: CGRect? = nil
+    var secondSplitRatio: Double = 2.0 / 3.0
 }
 
 enum CameraPlacement: String, CaseIterable, Identifiable, Sendable {
-    case off, overlay, regionA, regionB
+    case off, overlay, regionA, regionB, regionC
     var id: String { rawValue }
     var title: String {
         switch self {
@@ -25,6 +27,7 @@ enum CameraPlacement: String, CaseIterable, Identifiable, Sendable {
         case .overlay: return "Floating overlay"
         case .regionA: return "Replace region A"
         case .regionB: return "Replace region B"
+        case .regionC: return "Replace region C"
         }
     }
 }
@@ -118,23 +121,43 @@ struct CameraConfiguration: Sendable, Equatable {
 }
 
 enum CaptureLayout: String, CaseIterable, Identifiable, Sendable {
-    case single, stacked
+    case single, stacked, stackedThree
     var id: String { rawValue }
     var title: String {
         switch self {
         case .single: return "Single region"
         case .stacked: return "Stacked"
+        case .stackedThree: return "3 stacked"
         }
     }
+
+    var regionCount: Int {
+        switch self {
+        case .single: return 1
+        case .stacked: return 2
+        case .stackedThree: return 3
+        }
+    }
+
+    static let minimumRegionShare = 0.15
 
     static func clampedSplitRatio(_ value: Double) -> Double {
         value.isFinite ? min(max(value, 0.15), 0.85) : 0.5
     }
 
-    /// Rectangles use Core Image's bottom-left origin. A is top and B is bottom.
+    /// Cumulative boundaries from the top. Keep enough room for every panel,
+    /// even when loading malformed or crossing saved divider positions.
+    static func clampedTripleSplits(first: Double, second: Double) -> (first: Double, second: Double) {
+        let first = min(max(first.isFinite ? first : 1.0 / 3.0, minimumRegionShare), 1 - 2 * minimumRegionShare)
+        let second = min(max(second.isFinite ? second : 2.0 / 3.0, first + minimumRegionShare), 1 - minimumRegionShare)
+        return (first, second)
+    }
+
+    /// Rectangles use Core Image's bottom-left origin, ordered from top to bottom.
     /// Encoded output sizes are even; an even split boundary keeps
     /// both cells aligned with the encoder's chroma grid, with no canvas gaps.
-    func destinationRects(in outputSize: CGSize, splitRatio: Double) -> [CGRect] {
+    func destinationRects(in outputSize: CGSize, splitRatio: Double,
+                          secondSplitRatio: Double = 2.0 / 3.0) -> [CGRect] {
         let canvas = CGRect(origin: .zero, size: outputSize)
         let ratio = CGFloat(Self.clampedSplitRatio(splitRatio))
         switch self {
@@ -144,6 +167,15 @@ enum CaptureLayout: String, CaseIterable, Identifiable, Sendable {
             let height = min(max((outputSize.height * ratio / 2).rounded() * 2, 2), outputSize.height - 2)
             return [CGRect(x: 0, y: outputSize.height - height, width: outputSize.width, height: height),
                     CGRect(x: 0, y: 0, width: outputSize.width, height: outputSize.height - height)]
+        case .stackedThree:
+            let splits = Self.clampedTripleSplits(first: splitRatio, second: secondSplitRatio)
+            // Round the two cumulative boundaries, not individual heights, so
+            // all three rectangles tile the output without gaps or overlap.
+            let first = min(max((outputSize.height * splits.first / 2).rounded() * 2, 2), outputSize.height - 4)
+            let second = min(max((outputSize.height * splits.second / 2).rounded() * 2, first + 2), outputSize.height - 2)
+            return [CGRect(x: 0, y: outputSize.height - first, width: outputSize.width, height: first),
+                    CGRect(x: 0, y: outputSize.height - second, width: outputSize.width, height: second - first),
+                    CGRect(x: 0, y: 0, width: outputSize.width, height: outputSize.height - second)]
         }
     }
 }
@@ -153,6 +185,8 @@ struct CaptureComposition: Sendable {
     var splitRatio: Double = 0.5
     var primaryFrame: CGRect
     var secondaryFrame: CGRect?
+    var tertiaryFrame: CGRect? = nil
+    var secondSplitRatio: Double = 2.0 / 3.0
 }
 
 enum CaptureOrientation: String, CaseIterable, Identifiable, Sendable {

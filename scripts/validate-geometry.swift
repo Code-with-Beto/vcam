@@ -25,11 +25,12 @@ struct ValidateGeometry {
         validateSourcePixelCrop()
         validatePixelAlignedContrast()
         validateCameraFraming()
-        print("PASS: vertical geometry, negative display origins, screen-edge restoration, resize limits, clamped movement, Retina source-pixel mapping, integral crop origins, preserved crop dimensions/aspect, 1:1 edge contrast, and camera aspect-fill/zoom/pan clamping.")
+        validateTripleStack()
+        print("PASS: vertical geometry, negative display origins, screen-edge restoration, resize limits, clamped movement, Retina source-pixel mapping, integral crop origins, preserved crop dimensions/aspect, 1:1 edge contrast, camera aspect-fill/zoom/pan clamping, and three-panel divider bounds with complete even-pixel canvas coverage.")
     }
 
     static func validateCameraFraming() {
-        precondition(CaptureLayout.allCases == [.single, .stacked], "Only single and stacked layouts should remain")
+        precondition(CaptureLayout.allCases == [.single, .stacked, .stackedThree], "Only single, two-stack, and three-stack layouts should remain")
         let source = CGSize(width: 1920, height: 1080)
         let square = CGSize(width: 500, height: 500)
         let normal = CameraFramingConfiguration()
@@ -68,6 +69,51 @@ struct ValidateGeometry {
         }
         precondition(normal.sourceRect(in: .zero, filling: square) == .zero,
                      "A temporarily unavailable camera size must not produce invalid geometry")
+    }
+
+    static func validateTripleStack() {
+        let ratios: [Double] = [-10, 0, 0.15, 0.333, 0.5, 0.667, 0.85, 1, 10, .nan, .infinity, -.infinity]
+        let display = CGRect(x: -1920, y: -240, width: 1920, height: 1080)
+        for first in ratios {
+            for second in ratios {
+                let normalized = CaptureLayout.clampedTripleSplits(first: first, second: second)
+                precondition(normalized.0.isFinite && normalized.1.isFinite,
+                             "Nonfinite saved divider positions must resolve to finite values")
+                precondition(normalized.0 >= 0.15 - 1e-9 && normalized.1 - normalized.0 >= 0.15 - 1e-9 &&
+                             1 - normalized.1 >= 0.15 - 1e-9,
+                             "Each panel must keep at least 15 percent when dividers cross or leave the canvas")
+                let repeated = CaptureLayout.clampedTripleSplits(first: normalized.0, second: normalized.1)
+                precondition(abs(repeated.0 - normalized.0) < 1e-9 && abs(repeated.1 - normalized.1) < 1e-9,
+                             "Normalizing saved divider positions must be stable")
+                for size in [CGSize(width: 1080, height: 1920), CGSize(width: 1440, height: 2560), CGSize(width: 2560, height: 1440)] {
+                    let cells = CaptureLayout.stackedThree.destinationRects(in: size, splitRatio: first, secondSplitRatio: second)
+                    let canvas = CGRect(origin: .zero, size: size)
+                    precondition(cells.count == 3 && CaptureLayout.stackedThree.regionCount == 3)
+                    precondition(cells[0].maxY == size.height && cells[2].minY == 0,
+                                 "A must be at the top and C at the bottom of the output")
+                    precondition(cells.reduce(0) { $0 + $1.width * $1.height } == size.width * size.height,
+                                 "Three regions must cover the output exactly")
+                    for (index, cell) in cells.enumerated() {
+                        precondition(canvas.contains(cell) && cell.height >= size.height * 0.15 - 2,
+                                     "Even-pixel snapping must keep every panel in bounds and respect the minimum within one chroma cell")
+                        precondition([cell.minX, cell.minY, cell.width, cell.height].allSatisfy { $0.truncatingRemainder(dividingBy: 2) == 0 },
+                                     "All region edges must align to even encoder pixels")
+                        if index > 0 {
+                            precondition(cells[index - 1].minY == cell.maxY && cells[index - 1].intersection(cell).isEmpty,
+                                         "Adjacent panels must share one boundary without gaps or overlap")
+                        }
+                        let frame = CaptureGeometry.frame(width: 700, centeredAt: CGPoint(x: display.maxX, y: display.maxY),
+                            within: display, aspectRatio: cell.width / cell.height, minimumWidth: 1)
+                        let crop = CaptureGeometry.sourcePixelCrop(frame, displayFrame: display,
+                            pixelSize: CGSize(width: 3840, height: 2160))
+                        precondition(CGRect(x: 0, y: 0, width: 3840, height: 2160).contains(crop),
+                                     "Each three-panel screen crop must stay inside the Retina source at its top-right edge")
+                        precondition(abs(crop.width / crop.height - cell.width / cell.height) < 1e-9,
+                                     "A third source crop must retain its output panel aspect")
+                    }
+                }
+            }
+        }
     }
 
     static func validateSourcePixelCrop() {

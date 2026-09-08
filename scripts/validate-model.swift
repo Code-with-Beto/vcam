@@ -1,6 +1,7 @@
 // Run from the project root. The temporary source copy redirects preferences to
 // this validator's UUID-named suite; production source and app preferences stay intact.
-// sed 's/UserDefaults\.standard/ModelValidation.defaults/g' vcam/RecorderModel.swift \
+// sed -e 's/UserDefaults\.standard/ModelValidation.defaults/g' \
+//   -e 's/private func restoreFrame()/func restoreFrame()/' vcam/RecorderModel.swift \
 //   > /tmp/vcam-model-validation-source.swift
 // xcrun swiftc -swift-version 5 -target arm64-apple-macos15.0 \
 //   vcam/CaptureTypes.swift vcam/CapturePCM.swift vcam/CaptureMicrophone.swift vcam/CaptureCamera.swift \
@@ -46,8 +47,9 @@ enum ModelValidation {
     }
 
     static func validRegions(_ model: RecorderModel) throws {
-        let frames = model.hasTwoRegions ? [model.captureFrame, model.secondaryCaptureFrame] : [model.captureFrame]
-        let cells = model.layout.destinationRects(in: model.outputSize, splitRatio: model.splitRatio)
+        let frames = Array([model.captureFrame, model.secondaryCaptureFrame, model.tertiaryCaptureFrame].prefix(model.layout.regionCount))
+        let cells = model.layout.destinationRects(in: model.outputSize, splitRatio: model.splitRatio,
+                                                  secondSplitRatio: model.secondSplitRatio)
         let bounds = model.selectedDisplay!.visibleFrame.insetBy(dx: -0.001, dy: -0.001)
         for (index, frame) in frames.enumerated() {
             try require(frame.width.isFinite && frame.height.isFinite && frame.width > 0 && frame.height > 0,
@@ -60,6 +62,9 @@ enum ModelValidation {
         try require(abs(model.frameWidth - model.activeCaptureFrame.width) < 0.001,
                     "Frame-size controls no longer describe the selected region")
         try require(model.minimumFrameWidth <= model.maximumFrameWidth, "Frame-size slider has an invalid range")
+        try require(model.splitRatioRange.lowerBound <= model.splitRatioRange.upperBound
+                    && model.secondSplitRatioRange.lowerBound <= model.secondSplitRatioRange.upperBound,
+                    "Divider controls have an invalid range")
         try require(!model.isFrameVisible && !model.isPreviewing && !model.isRecording,
                     "Geometry validation must not show frames or start capture")
     }
@@ -86,9 +91,13 @@ struct ValidateModel {
             try await validateCameraOverlayPersistence()
             try validateLegacyLayoutMigration()
             try await validateCameraFraming()
+            try validateThreeRegionSplitsAndSizing()
+            try await validateThreeRegionTransitionsAndPersistence()
+            try await validateThirdCameraRegion()
+            try validateTripleSplitDefaults()
             try ModelValidation.require(application.windows.allSatisfy { !$0.isVisible },
                                         "Validation unexpectedly displayed a window")
-            print("PASS: Model split roundtrips, display clamping, independent B sizing, layout/orientation aspects, secondary persistence metadata, camera placement/geometry/persistence, legacy layout migration, and camera crop/zoom isolation without starting inputs. Preferences used an isolated temporary suite.")
+            print("PASS: Model two/three-region split roundtrips, display clamping, independent B/C sizing, layout/orientation aspects, hidden source persistence, camera A/B/C transitions, legacy defaults, and camera crop/zoom isolation without starting inputs. Preferences used an isolated temporary suite.")
         } catch {
             fputs("FAIL: \(error.localizedDescription)\n", stderr)
             exit(1)
@@ -158,7 +167,7 @@ struct ValidateModel {
             let model = try ModelValidation.makeModel(resolution: resolution)
             for orientation in [CaptureOrientation.portrait, .landscape, .portrait] {
                 await model.setOrientation(orientation)
-                for layout in [CaptureLayout.single, .stacked, .single] {
+                for layout in [CaptureLayout.single, .stacked, .stackedThree, .single] {
                     model.setLayout(layout)
                     if model.hasTwoRegions {
                         model.selectRegion(.secondary)
@@ -367,7 +376,7 @@ struct ValidateModel {
                          "secondaryFrameX", "secondaryFrameY", "secondaryFrameDisplayID"]
         let savedGeometry = savedKeys.map { defaults.double(forKey: $0) }
         let model = RecorderModel()
-        try ModelValidation.require(CaptureLayout.allCases == [.single, .stacked],
+        try ModelValidation.require(CaptureLayout.allCases == [.single, .stacked, .stackedThree],
                                     "The retired layout is still exposed as an available option")
         try ModelValidation.require(model.layout == .stacked && model.hasTwoRegions
                                     && model.cameraPlacement == .regionB && model.splitRatio == 0.35,
@@ -475,6 +484,196 @@ struct ValidateModel {
         }
         try ModelValidation.validRegions(model)
         print("Camera framing: zoom and pan work in all placements, persist and reset, clamp invalid settings, and leave source/overlay geometry, output, and microphone unchanged.")
+    }
+
+    @MainActor
+    private static func validateThreeRegionSplitsAndSizing() throws {
+        let model = try ModelValidation.makeModel(width: 1600, height: 900)
+        model.setLayout(.stacked)
+        model.setSplitRatio(0.35)
+        model.setLayout(.stackedThree)
+        try ModelValidation.require(model.activeRegions == [.primary, .secondary, .tertiary]
+                                    && abs(model.splitRatio - 1.0 / 3.0) < 0.000001
+                                    && abs(model.secondSplitRatio - 2.0 / 3.0) < 0.000001,
+                                    "The first three-panel layout must open at equal thirds")
+        model.setFrameWidth(1000)
+        model.selectRegion(.secondary)
+        model.setFrameWidth(800)
+        let first = model.captureFrame, second = model.secondaryCaptureFrame
+        model.selectRegion(.tertiary)
+        model.setFrameHeight(340)
+        try ModelValidation.require(model.captureFrame == first && model.secondaryCaptureFrame == second
+                                    && abs(model.tertiaryCaptureFrame.height - 340) < 0.001,
+                                    "Explicit C sizing changed A/B or failed to update C")
+        let third = model.tertiaryCaptureFrame
+        let firstBoundary = model.splitRatio
+        model.setSecondSplitRatio(0.85)
+        try ModelValidation.require(model.splitRatio == firstBoundary && model.captureFrame == first,
+                                    "Moving the second divider changed A or the first divider")
+        model.setSplitRatio(0.7)
+        try ModelValidation.require(model.captureFrame.width < first.width - 1,
+                                    "Triple divider fixture did not exercise display clamping")
+        for (firstSplit, secondSplit) in [(0.15, 0.3), (0.7, 0.85), (0.4, 0.8), (0.15, 0.3)] {
+            model.setSecondSplitRatio(secondSplit)
+            model.setSplitRatio(firstSplit)
+            model.setSecondSplitRatio(secondSplit)
+            try ModelValidation.validRegions(model)
+            let shares = [model.splitRatio, model.secondSplitRatio - model.splitRatio, 1 - model.secondSplitRatio]
+            try ModelValidation.require(shares.allSatisfy { $0 >= 0.15 - 0.000001 },
+                                        "Three-panel split allowed a panel smaller than 15 percent")
+        }
+        model.setSplitRatio(-100)
+        model.setSecondSplitRatio(100)
+        try ModelValidation.require(model.splitRatio == 0.15 && model.secondSplitRatio == 0.85,
+                                    "Out-of-range dividers did not clamp to the canvas limits")
+        model.setSplitRatio(.nan)
+        model.setSecondSplitRatio(.infinity)
+        try ModelValidation.require(model.splitRatio == 0.15 && model.secondSplitRatio == 0.85,
+                                    "Nonfinite divider input changed valid split state")
+        model.equalizeSplit()
+        try ModelValidation.equalSize(model.captureFrame.size, first.size, "Triple A clamped width roundtrip")
+        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second.size, "Triple B clamped width roundtrip")
+        try ModelValidation.equalSize(model.tertiaryCaptureFrame.size, third.size, "Triple C clamped width roundtrip")
+        model.setLayout(.stacked)
+        try ModelValidation.require(model.splitRatio == 0.35 && model.selectedRegion == .secondary,
+                                    "Returning to two panels lost its previous split or retained unavailable C selection")
+        model.setSplitRatio(0.85)
+        _ = model.secondSplitRatioRange
+        model.equalizeSplit()
+        try ModelValidation.require(model.splitRatio == 0.5, "Two-panel Equal split did not restore 50/50")
+        try ModelValidation.validRegions(model)
+        print("Three panels: independent C sizing, both constrained dividers, and equal-third restoration preserve each source scale after repeated display clamping.")
+    }
+
+    @MainActor
+    private static func validateThreeRegionTransitionsAndPersistence() async throws {
+        let model = try ModelValidation.makeModel(width: 3000, height: 2400)
+        model.setLayout(.stackedThree)
+        model.setSplitRatio(0.25)
+        model.setSecondSplitRatio(0.65)
+        model.setFrameWidth(720)
+        model.selectRegion(.secondary)
+        model.setFrameWidth(540)
+        model.selectRegion(.tertiary)
+        model.setFrameWidth(450)
+        let first = model.captureFrame, second = model.secondaryCaptureFrame, third = model.tertiaryCaptureFrame
+        for layout in [CaptureLayout.stacked, .single] {
+            model.setLayout(layout)
+            try ModelValidation.require(model.tertiaryCaptureFrame == third,
+                                        "Reducing the panel count changed hidden C geometry")
+            let defaults = ModelValidation.defaults
+            try ModelValidation.require(defaults.double(forKey: "tertiaryFrameWidth") == third.width
+                                        && defaults.double(forKey: "tertiaryFrameHeight") == third.height
+                                        && defaults.integer(forKey: "tertiaryFrameDisplayID") == Int(model.selectedDisplayID),
+                                        "C shape or display metadata was lost when its panel was hidden")
+            let restored = RecorderModel()
+            restored.displays = model.displays
+            restored.selectedDisplayID = model.selectedDisplayID
+            // Only the validator's temporary source copy exposes this method.
+            // It restores stored geometry without discovery, permissions, or capture.
+            restored.restoreFrame()
+            try ModelValidation.require(restored.tertiaryCaptureFrame == third,
+                                        "A relaunch failed to restore hidden C coordinates and shape")
+            restored.setLayout(.stackedThree)
+            try ModelValidation.require(restored.splitRatio == 0.25 && restored.secondSplitRatio == 0.65,
+                                        "Three-panel divider positions did not survive a hidden-layout relaunch")
+            try ModelValidation.equalSize(restored.captureFrame.size, first.size, "Relaunched A scale")
+            try ModelValidation.equalSize(restored.secondaryCaptureFrame.size, second.size, "Relaunched B scale")
+            try ModelValidation.equalSize(restored.tertiaryCaptureFrame.size, third.size, "Relaunched C scale")
+            try ModelValidation.validRegions(restored)
+            model.setLayout(.stackedThree)
+        }
+        model.setLayout(.single)
+        await model.setOrientation(.landscape)
+        try ModelValidation.require(model.secondaryCaptureFrame == second && model.tertiaryCaptureFrame == third,
+                                    "Rotating Single layout changed hidden source coordinates or shape")
+        model.setLayout(.stackedThree)
+        let expectedWidth = third.width * model.outputSize.width / 1440
+        try ModelValidation.require(abs(model.tertiaryCaptureFrame.width - expectedWidth) < 0.001,
+                                    "Hidden C output-cell metadata did not preserve its source scale across orientation changes")
+        await model.setOrientation(.portrait)
+        try ModelValidation.equalSize(model.captureFrame.size, first.size, "Three-panel A orientation roundtrip")
+        try ModelValidation.equalSize(model.secondaryCaptureFrame.size, second.size, "Three-panel B orientation roundtrip")
+        try ModelValidation.equalSize(model.tertiaryCaptureFrame.size, third.size, "Three-panel C orientation roundtrip")
+        try ModelValidation.validRegions(model)
+        let originalDisplay = model.selectedDisplayID
+        model.setLayout(.single)
+        let other = DisplayChoice(id: 0xC0A2, name: "Other synthetic display", frame: CGRect(x: 0, y: 0, width: 1200, height: 900),
+                                  visibleFrame: CGRect(x: 0, y: 0, width: 1200, height: 900), scale: 1)
+        model.displays.append(other)
+        model.selectDisplay(other.id)
+        try ModelValidation.require(ModelValidation.defaults.integer(forKey: "tertiaryFrameDisplayID") == Int(originalDisplay),
+                                    "Switching displays associated hidden C's coordinates with another display")
+        print("C persistence: hidden frame geometry, display identity, divider positions, and output scale survive two/single layouts, relaunch, and orientation roundtrips.")
+    }
+
+    @MainActor
+    private static func validateThirdCameraRegion() async throws {
+        let model = try ModelValidation.makeModel()
+        model.setLayout(.stackedThree)
+        model.selectRegion(.tertiary)
+        model.setFrameWidth(480)
+        await model.setCameraDevice("synthetic-third-camera")
+        let third = model.tertiaryCaptureFrame
+        await model.setCameraPlacement(.regionC)
+        try ModelValidation.require(model.activeRegionIsCamera && model.isCameraRegion(.tertiary)
+                                    && !model.isCameraRegion(.primary) && !model.isCameraRegion(.secondary),
+                                    "Camera C replaced the wrong panel")
+        model.setFrameWidth(600)
+        model.setFrameHeight(100)
+        try ModelValidation.require(model.tertiaryCaptureFrame == third,
+                                    "Screen-size controls changed C while it was assigned to a camera")
+        model.setCameraFraming(CameraFramingConfiguration(zoom: 2.5, center: CGPoint(x: 0.6, y: 0.4)))
+        await model.setCameraPlacement(.off)
+        try ModelValidation.require(!model.activeRegionIsCamera && model.tertiaryCaptureFrame == third,
+                                    "Turning C camera off lost its previous screen source")
+        await model.setCameraPlacement(.regionC)
+        let restored = RecorderModel()
+        try ModelValidation.require(restored.layout == .stackedThree && restored.cameraPlacement == .regionC
+                                    && restored.cameraFraming == model.cameraFraming,
+                                    "Camera C placement and crop failed to persist")
+        model.setLayout(.stacked)
+        try ModelValidation.require(model.cameraPlacement == .regionB && model.selectedRegion == .secondary
+                                    && model.isCameraRegion(.secondary),
+                                    "Reducing three panels to two did not move camera C into B")
+        await model.setCameraPlacement(.regionC)
+        try ModelValidation.require(model.cameraPlacement == .regionB,
+                                    "Two-panel layout accepted unavailable camera C")
+        model.setLayout(.stackedThree)
+        await model.setCameraPlacement(.regionC)
+        model.setLayout(.single)
+        try ModelValidation.require(model.cameraPlacement == .overlay && model.selectedRegion == .primary,
+                                    "Reducing camera C to Single did not keep it as an overlay")
+        await model.setCameraPlacement(.regionC)
+        try ModelValidation.require(model.cameraPlacement == .overlay,
+                                    "Single layout accepted unavailable camera C")
+        try ModelValidation.validRegions(model)
+        print("Camera C: source geometry and crop persist; Off restores screen content, two panels remap C to B, and Single remaps it to an overlay.")
+    }
+
+    @MainActor
+    private static func validateTripleSplitDefaults() throws {
+        let defaults = ModelValidation.defaults
+        defaults.removePersistentDomain(forName: ModelValidation.suite)
+        defaults.set(CaptureLayout.stacked.rawValue, forKey: "captureLayout")
+        defaults.set(0.72, forKey: "splitRatio")
+        let old = RecorderModel()
+        try ModelValidation.require(old.splitRatio == 0.72,
+                                    "Adding three panels changed existing two-panel proportions")
+        old.setLayout(.stackedThree)
+        try ModelValidation.require(abs(old.splitRatio - 1.0 / 3.0) < 0.000001
+                                    && abs(old.secondSplitRatio - 2.0 / 3.0) < 0.000001,
+                                    "Existing two-panel preferences leaked into the first three-panel setup")
+        defaults.set(CaptureLayout.stackedThree.rawValue, forKey: "captureLayout")
+        defaults.set(0.99, forKey: "threeRegionSplitRatio")
+        defaults.set(0.01, forKey: "secondSplitRatio")
+        let repaired = RecorderModel()
+        let shares = [repaired.splitRatio, repaired.secondSplitRatio - repaired.splitRatio, 1 - repaired.secondSplitRatio]
+        try ModelValidation.require(shares.allSatisfy { $0 >= 0.15 - 0.000001 },
+                                    "Invalid stored divider order created an undersized panel")
+        _ = repaired.splitRatioRange
+        _ = repaired.secondSplitRatioRange
+        print("Split defaults: old two-panel proportions stay intact, first use opens at thirds, and invalid saved divider order is repaired.")
     }
 
     @MainActor

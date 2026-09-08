@@ -12,10 +12,11 @@ import VideoToolbox
 @main
 struct ValidateCamera {
     static let size = CGSize(width: 1440, height: 2560)
-    static let display = CGRect(x: -400, y: -100, width: 400, height: 300)
-    static let primary = CGRect(x: -400, y: -100, width: 200, height: 300)
-    static let secondary = CGRect(x: -200, y: -100, width: 200, height: 300)
-    static let screenColors = [[35, 170, 65], [35, 75, 210]]
+    static let display = CGRect(x: -450, y: -100, width: 450, height: 300)
+    static let primary = CGRect(x: -450, y: -100, width: 150, height: 300)
+    static let secondary = CGRect(x: -300, y: -100, width: 150, height: 300)
+    static let tertiary = CGRect(x: -150, y: -100, width: 150, height: 300)
+    static let screenColors = [[35, 170, 65], [35, 75, 210], [210, 70, 35]]
     static let cameraLuma = [64, 112, 160, 208]
 
     static func main() async throws {
@@ -70,7 +71,35 @@ struct ValidateCamera {
         states.append((.stacked, configuration))
         configuration.framing = CameraFramingConfiguration()
         states.append((.stacked, configuration))
-        let compositions = states.map { CaptureComposition(layout: $0.0, primaryFrame: primary, secondaryFrame: secondary) }
+        // Continue the same writer into three-panel compositions. The native
+        // source has a third unique screen stripe to detect C/B aliasing.
+        configuration.placement = .overlay
+        configuration.overlay.center = CGPoint(x: 0.75, y: 0.82)
+        states.append((.stackedThree, configuration))
+        configuration.overlay.shape = .roundedRectangle
+        states.append((.stackedThree, configuration))
+        configuration.placement = .regionC
+        configuration.mirrored = false
+        configuration.framing = CameraFramingConfiguration(zoom: 2.2, center: CGPoint(x: 0.85, y: 0.2))
+        states.append((.stackedThree, configuration))
+        configuration.mirrored = true
+        states.append((.stackedThree, configuration))
+        configuration.placement = .regionA
+        states.append((.stackedThree, configuration))
+        configuration.placement = .regionB
+        states.append((.stackedThree, configuration))
+        configuration.placement = .regionC
+        configuration.framing = CameraFramingConfiguration()
+        states.append((.stackedThree, configuration))
+        configuration.placement = .off
+        states.append((.stackedThree, configuration))
+        configuration.placement = .regionB
+        states.append((.stacked, configuration))
+        configuration.placement = .overlay
+        states.append((.single, configuration))
+        let compositions = states.map { CaptureComposition(layout: $0.0,
+            splitRatio: $0.0 == .stackedThree ? 1.0 / 3 : 0.5,
+            primaryFrame: primary, secondaryFrame: secondary, tertiaryFrame: tertiary) }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("vcam-camera-validation-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let result = try await CaptureWorker.recordCompositionFixture(screen, displayFrame: display,
@@ -89,12 +118,14 @@ struct ValidateCamera {
             let image = try Pixels(try await generator.image(at: CMTime(seconds: time, preferredTimescale: 600)).image)
             images.append(image)
             let state = states[index]
-            let cells = state.0.destinationRects(in: size, splitRatio: 0.5)
+            let cells = state.0.destinationRects(in: size, splitRatio: compositions[index].splitRatio,
+                secondSplitRatio: compositions[index].secondSplitRatio)
             let cameraRect: CGRect?
             switch state.1.placement {
             case .overlay: cameraRect = state.1.overlay.rect(in: size)
             case .regionA: cameraRect = cells[0]
             case .regionB: cameraRect = cells[1]
+            case .regionC: cameraRect = cells[2]
             case .off: cameraRect = nil
             }
             if let rect = cameraRect {
@@ -127,7 +158,8 @@ struct ValidateCamera {
                 }
             }
             for (cellIndex, cell) in cells.enumerated() {
-                let replaced = (cellIndex == 0 && state.1.placement == .regionA) || (cellIndex == 1 && state.1.placement == .regionB)
+                let replaced = (cellIndex == 0 && state.1.placement == .regionA) ||
+                    (cellIndex == 1 && state.1.placement == .regionB) || (cellIndex == 2 && state.1.placement == .regionC)
                 if !replaced {
                     let point = CGPoint(x: cell.minX + cell.width * 0.1, y: cell.minY + cell.height * 0.1)
                     if cameraRect?.contains(point) != true {
@@ -146,7 +178,7 @@ struct ValidateCamera {
         try check(images[2].pixel(expansionPoint).max()! - images[2].pixel(expansionPoint).min()! < 8,
                   "Resizing overlay must cover the newly included screen pixels with the grayscale camera")
         try await validateAudioAndTiming(asset, video: video[0], audio: audio[0])
-        print("PASS: 1440×2560 camera circle/rounded mask, move/resize, live zoom/pan/reset, post-mirror crop direction, no exposed crop edges, Rec.709 NV12 color conversion, live Off/On, single/stacked layouts and A/B replacement on one monotonic writer timeline, released camera providers, and independent mono AAC.")
+        print("PASS: 1440×2560 camera circle/rounded mask, move/resize, live zoom/pan/reset, post-mirror crop direction, no exposed crop edges, Rec.709 NV12 color conversion, live Off/On, A/B/C replacement and 3 → 2 → 1 panels on one monotonic writer timeline, released camera providers, and independent mono AAC.")
         print("Synthetic camera recording: \(result.url.path)")
     }
 
@@ -170,12 +202,12 @@ struct ValidateCamera {
 
     static func makeScreen() throws -> CVPixelBuffer {
         var buffer: CVPixelBuffer?
-        try check(CVPixelBufferCreate(nil, 800, 600, kCVPixelFormatType_32BGRA, nil, &buffer) == kCVReturnSuccess, "Cannot create screen fixture")
+        try check(CVPixelBufferCreate(nil, 900, 600, kCVPixelFormatType_32BGRA, nil, &buffer) == kCVReturnSuccess, "Cannot create screen fixture")
         CVPixelBufferLockBaseAddress(buffer!, [])
         let data = CVPixelBufferGetBaseAddress(buffer!)!.assumingMemoryBound(to: UInt8.self)
         let stride = CVPixelBufferGetBytesPerRow(buffer!)
-        for y in 0..<600 { for x in 0..<800 {
-            let rgb = screenColors[x < 400 ? 0 : 1], offset = y * stride + x * 4
+        for y in 0..<600 { for x in 0..<900 {
+            let rgb = screenColors[x / 300], offset = y * stride + x * 4
             data[offset] = UInt8(rgb[2]); data[offset + 1] = UInt8(rgb[1]); data[offset + 2] = UInt8(rgb[0]); data[offset + 3] = 255
         } }
         CVPixelBufferUnlockBaseAddress(buffer!, [])

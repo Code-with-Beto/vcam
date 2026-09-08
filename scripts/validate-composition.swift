@@ -28,7 +28,7 @@ struct ValidateComposition {
         let source = try makeSource()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("vcam-composition-validation-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        for layout in CaptureLayout.allCases {
+        for layout in [CaptureLayout.single, .stacked] {
             // The source regions deliberately have a different aspect from each cell.
             // The white circles must stay circular under the defensive aspect-fill.
             let phases = [
@@ -43,6 +43,22 @@ struct ValidateComposition {
                               expectedColors: [[0, 2], [1, 2], [1, 3], [1, 3]], size: size)
             print("PASS: \(layout.rawValue): encoded cell positions, independent A/B movement, live split, uniform aspect-fill, one synchronized mono AAC track.")
         }
+        let triplePhases = [
+            CaptureComposition(layout: .stackedThree, splitRatio: 1.0 / 3, primaryFrame: sources[0], secondaryFrame: sources[2], tertiaryFrame: sources[1]),
+            CaptureComposition(layout: .stackedThree, splitRatio: 1.0 / 3, primaryFrame: sources[3], secondaryFrame: sources[2], tertiaryFrame: sources[1]),
+            CaptureComposition(layout: .stackedThree, splitRatio: 1.0 / 3, primaryFrame: sources[3], secondaryFrame: sources[0], tertiaryFrame: sources[1]),
+            CaptureComposition(layout: .stackedThree, splitRatio: 1.0 / 3, primaryFrame: sources[3], secondaryFrame: sources[0], tertiaryFrame: sources[2]),
+            CaptureComposition(layout: .stackedThree, splitRatio: 0.48, primaryFrame: sources[3], secondaryFrame: sources[0], tertiaryFrame: sources[2], secondSplitRatio: 0.70),
+            CaptureComposition(layout: .stackedThree, splitRatio: 0.48, primaryFrame: sources[3], secondaryFrame: sources[0], tertiaryFrame: sources[2], secondSplitRatio: 0.84),
+            CaptureComposition(layout: .stackedThree, splitRatio: 0.25, primaryFrame: sources[3], secondaryFrame: sources[0], tertiaryFrame: sources[2], secondSplitRatio: 0.64),
+            CaptureComposition(layout: .stacked, splitRatio: 0.55, primaryFrame: sources[3], secondaryFrame: sources[0], tertiaryFrame: sources[2]),
+            CaptureComposition(layout: .single, primaryFrame: sources[3], secondaryFrame: sources[0], tertiaryFrame: sources[2])
+        ]
+        let triple = try await CaptureWorker.recordCompositionFixture(source, displayFrame: display,
+            phases: triplePhases, to: directory.appendingPathComponent("stacked-three-transitions.mp4"), outputSize: size)
+        try await inspect(triple.url, times: triple.sampleTimes, phases: triplePhases,
+            expectedColors: [[0, 2, 1], [3, 2, 1], [3, 0, 1], [3, 0, 2], [3, 0, 2], [3, 0, 2], [3, 0, 2], [3, 0], [3]], size: size)
+        print("PASS: three separate screen crops, independent A/B/C movement, both live dividers, and 3 → 2 → 1 panels on one synchronized movie timeline.")
         print("Composition recordings: \(directory.path)")
     }
 
@@ -52,7 +68,7 @@ struct ValidateComposition {
                 for ratio in [-1.0, 0.15, 0.333, 0.5, 0.85, 2.0, .nan] {
                     let cells = layout.destinationRects(in: size, splitRatio: ratio)
                     let canvas = CGRect(origin: .zero, size: size)
-                    try check(cells.count == (layout == .single ? 1 : 2), "Incorrect number of destination cells")
+                    try check(cells.count == layout.regionCount, "Incorrect number of destination cells")
                     try check(cells.allSatisfy { canvas.contains($0) && $0.width > 0 && $0.height > 0 }, "A destination lies outside the canvas")
                     try check(cells.allSatisfy { $0.width.truncatingRemainder(dividingBy: 2) == 0 && $0.height.truncatingRemainder(dividingBy: 2) == 0 }, "Cell dimensions must be even")
                     try check(cells.reduce(0) { $0 + $1.width * $1.height } == size.width * size.height, "Cells must cover the entire canvas without gaps")
@@ -125,6 +141,8 @@ struct ValidateComposition {
             }
         }
         try check(timingReader.status == .completed && frameTimes.count > 20, "Composition video is incomplete")
+        try check(zip(frameTimes, frameTimes.dropFirst()).allSatisfy { $1 > $0 },
+                  "Live region, divider, and layout changes must preserve strictly increasing frame times")
         let frameRate = Double(frameTimes.count - 1) / (frameTimes.last! - frameTimes.first!)
         try check(frameRate > 27 && frameRate < 33, "Composition missed the 30 fps cadence: \(frameRate)")
         print(String(format: "%@ %.0f×%.0f: %.2f fps; %d frames; A/V end difference %.1f ms",
@@ -138,14 +156,22 @@ struct ValidateComposition {
             let cgImage = try await generator.image(at: CMTime(seconds: time, preferredTimescale: 600)).image
             let image = try ImagePixels(cgImage)
             images.append(image)
-            let cells = phases[index].layout.destinationRects(in: size, splitRatio: phases[index].splitRatio)
+            let cells = phases[index].layout.destinationRects(in: size, splitRatio: phases[index].splitRatio,
+                secondSplitRatio: phases[index].secondSplitRatio)
             for (cellIndex, cell) in cells.enumerated() {
                 let rgb = image.pixel(at: CGPoint(x: cell.minX + cell.width * 0.18, y: cell.minY + cell.height * 0.2))
                 try expect(rgb, palette[expectedColors[index][cellIndex]], "Phase \(index), cell \(cellIndex)")
                 try verifyCircle(image, in: cell)
             }
         }
-        if phases[0].layout != .single {
+        if phases[0].layout == .stackedThree {
+            let upperCrossing = CGPoint(x: size.width * 0.18, y: size.height * 0.60)
+            try expect(images[3].pixel(at: upperCrossing), palette[0], "Before the upper divider moves, this pixel must belong to B")
+            try expect(images[4].pixel(at: upperCrossing), palette[3], "After the upper divider moves, this pixel must belong to A")
+            let lowerCrossing = CGPoint(x: size.width * 0.18, y: size.height * 0.22)
+            try expect(images[4].pixel(at: lowerCrossing), palette[2], "Before the lower divider moves, this pixel must belong to C")
+            try expect(images[5].pixel(at: lowerCrossing), palette[0], "After the lower divider moves, this pixel must belong to B")
+        } else if phases[0].layout == .stacked {
             let crossingPoint = CGPoint(x: size.width * 0.18, y: size.height * 0.4)
             try expect(images[2].pixel(at: crossingPoint), palette[3], "Before moving the split, this pixel must belong to B")
             try expect(images[3].pixel(at: crossingPoint), palette[1], "After moving the split, this pixel must belong to A")
